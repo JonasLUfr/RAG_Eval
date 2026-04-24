@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs wc *)",
+      "Bash(.venv/Scripts/python *)",
+      "Bash(.venv\\\\Scripts\\\\python.exe *)",
+      "Bash(python3 *)",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('app/main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\" 2>&1)",
+      "PowerShell(Get-ChildItem \"C:\\\\Windows\\\\Fonts\" | Where-Object { $_.Name -match \"sim|msyh|yahei\" -and $_.Extension -eq \".ttf\" } | Select-Object Name, FullName | Format-Table)",
+      "Bash(python -m py_compile app/main.py)"
+    ]
+  }
+}

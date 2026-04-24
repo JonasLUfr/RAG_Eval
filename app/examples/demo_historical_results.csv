@@ -1,0 +1,4 @@
+question,reference_answer,answer,retrieved_contexts,citations,latency_ms,token_usage
+O1001 的订单状态是什么？,O1001 的订单状态为 paid。,O1001 的订单状态是 paid。,"orders: O1001,U01,2026-03-01,paid,299.00","orders.status",420,380
+如果用户询问退款金额，系统需要引用哪张表？,查询退款金额时必须引用 refunds 表。,需要查看 refunds 表，因为退款金额记录在 refund_amount 字段。,"refunds(refund_id, order_id, refund_amount, refund_reason, refund_date)","business_rules#1",510,460
+当问题没有时间范围时，系统应该直接给出某个月的统计吗？,不应直接假设某个月；应说明默认范围或要求用户补充时间范围。,可以直接按 3 月统计。,"orders(order_id, user_id, order_date, status, total_amount)","",380,300
