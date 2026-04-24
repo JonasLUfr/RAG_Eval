@@ -1202,7 +1202,7 @@ with tab_export:
         exporter = ExportCenter(config)
 
         comparison_rows = []
-        compare_labels = st.multiselect("可选：加入对比实验到 PDF", list(options.keys()))
+        compare_labels = st.multiselect("可选：加入对比实验到 Markdown 报告", list(options.keys()))
         for label in compare_labels:
             compare_run = store.get_experiment(options[label])
             comparison_rows.append(
@@ -1213,16 +1213,16 @@ with tab_export:
                 )
             )
 
-        col_excel, col_pdf = st.columns(2)
+        col_excel, col_md = st.columns(2)
         with col_excel:
             if st.button("一键导出 Excel", type="primary"):
                 path = exporter.export_excel(project, run, samples, responses, results, summary)
                 st.success(f"Excel 已导出：{path}")
                 with Path(path).open("rb") as file:
                     st.download_button("下载 Excel", data=file, file_name=Path(path).name)
-        with col_pdf:
-            if st.button("一键导出 PDF", type="primary"):
-                path = exporter.export_pdf(project, run, samples, responses, results, summary, comparison_rows)
-                st.success(f"PDF 已导出：{path}")
+        with col_md:
+            if st.button("一键导出 Markdown", type="primary"):
+                path = exporter.export_markdown(project, run, samples, responses, results, summary, comparison_rows)
+                st.success(f"Markdown 已导出：{path}")
                 with Path(path).open("rb") as file:
-                    st.download_button("下载 PDF", data=file, file_name=Path(path).name)
+                    st.download_button("下载 Markdown", data=file, file_name=Path(path).name, mime="text/markdown")

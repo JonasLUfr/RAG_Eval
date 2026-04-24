@@ -1,53 +1,21 @@
 from __future__ import annotations
 
 import logging
-import os
-import platform
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from jinja2 import Environment, FileSystemLoader, select_autoescape
-from xhtml2pdf import pisa
 
-from app.core.config import AppConfig, ROOT_DIR
+from app.core.config import AppConfig
 from app.models import EvalResult, EvalSample, ExperimentRun, ProjectContext, SystemResponse
 
 
 logger = logging.getLogger(__name__)
 
 
-def _find_cjk_font_path() -> str | None:
-    """Return the absolute path of the first available CJK TTF font, or None."""
-    if platform.system() == "Windows":
-        fonts_dir = r"C:\Windows\Fonts"
-        for fname in ("simhei.ttf", "simkai.ttf", "simfang.ttf", "simsunb.ttf"):
-            p = os.path.join(fonts_dir, fname)
-            if os.path.exists(p):
-                return p
-    return None
-
-
-def _pisa_link_callback(uri: str, rel: str) -> str:
-    """
-    xhtml2pdf calls this to resolve every resource URL (fonts, images).
-    We convert file:// URIs to absolute local paths so ReportLab can load the TTF.
-    """
-    if uri.startswith("file:///"):
-        local = uri[8:].replace("/", os.sep)
-        if os.path.exists(local):
-            return local
-    return uri
-
-
 class ExportCenter:
     def __init__(self, config: AppConfig):
         self.config = config
-        self.template_dir = ROOT_DIR / "templates"
-        self.env = Environment(
-            loader=FileSystemLoader(str(self.template_dir)),
-            autoescape=select_autoescape(["html", "xml"]),
-        )
 
     def export_excel(
         self,
@@ -82,7 +50,6 @@ class ExportCenter:
             qtype_df.to_excel(writer, sheet_name="question_type_distribution", index=False)
 
             workbook = writer.book
-            # 设置默认字体支持中文（Microsoft YaHei 覆盖全部 CJK 字形）
             workbook.formats[0].set_font_name("Microsoft YaHei")
             header_format = workbook.add_format({
                 "bold": True, "bg_color": "#D9EAF7", "font_name": "Microsoft YaHei",
@@ -93,7 +60,7 @@ class ExportCenter:
                 sheet.set_column(0, 20, 22)
         return path
 
-    def export_pdf(
+    def export_markdown(
         self,
         context: ProjectContext,
         run: ExperimentRun,
@@ -104,32 +71,90 @@ class ExportCenter:
         comparison_rows: list[dict] | None = None,
     ) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = self.config.export_dir / f"{run.name}_{timestamp}.pdf"
-        template = self.env.get_template("report.html")
+        path = self.config.export_dir / f"{run.name}_{timestamp}.md"
         detail_df = self._detail_dataframe(samples, responses, results)
-        failures = detail_df[detail_df["失败标签"].astype(str) != "[]"].head(10).to_dict("records") if not detail_df.empty else []
-        # Build a file:// URI for the CJK font so xhtml2pdf can resolve it via link_callback
-        _font_path = _find_cjk_font_path()
-        cjk_font_uri = "file:///" + _font_path.replace(os.sep, "/") if _font_path else None
-        html = template.render(
-            context=context,
-            run=run,
-            samples=samples,
-            summary=summary,
-            metric_rows=self._metric_summary_dataframe(results).to_dict("records"),
-            qtype_rows=self._question_type_distribution(samples).to_dict("records"),
-            failures=failures,
-            comparison_rows=comparison_rows or [],
-            generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            cjk_font_uri=cjk_font_uri,
+        failures = (
+            detail_df[detail_df["失败标签"].astype(str) != "[]"].head(10)
+            if not detail_df.empty else detail_df
         )
-        with path.open("wb") as output:
-            result = pisa.CreatePDF(
-                html, dest=output, encoding="utf-8", link_callback=_pisa_link_callback
-            )
-        if result.err:
-            logger.error("PDF 导出失败 err=%s", result.err)
-            raise RuntimeError("PDF 导出失败，请检查 xhtml2pdf 依赖和 HTML 模板。")
+        metric_df = self._metric_summary_dataframe(results)
+        qtype_df = self._question_type_distribution(samples)
+
+        lines: list[str] = []
+        lines += [
+            f"# {context.name} - 评测报告",
+            f"> 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ",
+            f"> 实验：{run.name}　模式：{run.mode}",
+            "",
+            "## 项目摘要",
+            "",
+            f"| 字段 | 内容 |",
+            f"|------|------|",
+            f"| 项目 ID | {context.project_id} |",
+            f"| 项目背景 | {_trunc(context.project_background, 300)} |",
+            f"| 被评测系统 | {_trunc(context.system_description, 200)} |",
+            f"| 评测目标 | {_trunc(context.evaluation_goals, 200)} |",
+            f"| 业务规则 | {_trunc(context.business_rules, 200)} |",
+            "",
+            "## 实验概况",
+            "",
+            f"| 指标 | 值 |",
+            f"|------|----|",
+            f"| 样本数 | {summary.get('samples', 0)} |",
+            f"| 成功率 | {summary.get('success_rate', 0)} |",
+            f"| 平均总分 | {summary.get('avg_score', 0)} |",
+            f"| 平均延迟(ms) | {summary.get('avg_latency_ms', 0)} |",
+            f"| 估算成本 | {summary.get('estimated_cost', 0)} |",
+            "",
+        ]
+
+        lines += ["## 总体指标", ""]
+        if not metric_df.empty:
+            lines.append("| 指标 | 平均分 |")
+            lines.append("|------|--------|")
+            for _, row in metric_df.iterrows():
+                lines.append(f"| {row['指标']} | {row['平均分']} |")
+        else:
+            lines.append("_暂无评估结果_")
+        lines.append("")
+
+        lines += ["## 题型分布", ""]
+        if not qtype_df.empty:
+            lines.append("| 题型 | 数量 |")
+            lines.append("|------|------|")
+            for _, row in qtype_df.iterrows():
+                lines.append(f"| {row['题型']} | {row['数量']} |")
+        else:
+            lines.append("_无题型数据_")
+        lines.append("")
+
+        lines += ["## 代表性失败案例（前10条）", ""]
+        if not failures.empty:
+            lines.append("| 问题 | 系统答案 | 总分 | 失败标签 | 裁判理由 |")
+            lines.append("|------|----------|------|----------|----------|")
+            for _, row in failures.iterrows():
+                q = _trunc(str(row.get("问题", "")), 60)
+                a = _trunc(str(row.get("系统答案", "")), 80)
+                score = row.get("总分", "")
+                labels = str(row.get("失败标签", ""))
+                reason = _trunc(str(row.get("裁判理由", "")), 100)
+                lines.append(f"| {q} | {a} | {score} | {labels} | {reason} |")
+        else:
+            lines.append("_无失败案例_")
+        lines.append("")
+
+        if comparison_rows:
+            lines += ["## 实验对比", ""]
+            lines.append("| 实验 | 样本数 | 成功率 | 平均总分 | 平均延迟(ms) | 估算成本 |")
+            lines.append("|------|--------|--------|----------|-------------|----------|")
+            for r in comparison_rows:
+                lines.append(
+                    f"| {r.get('name','')} | {r.get('samples','')} | {r.get('success_rate','')} "
+                    f"| {r.get('avg_score','')} | {r.get('avg_latency_ms','')} | {r.get('estimated_cost','')} |"
+                )
+            lines.append("")
+
+        path.write_text("\n".join(lines), encoding="utf-8")
         return path
 
     def _detail_dataframe(
@@ -184,3 +209,7 @@ class ExportCenter:
             .reset_index(name="数量")
         )
 
+
+def _trunc(text: str, limit: int) -> str:
+    text = text.replace("|", "｜").replace("\n", " ")
+    return text[:limit] + "…" if len(text) > limit else text
