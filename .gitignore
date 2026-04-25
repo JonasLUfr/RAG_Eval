@@ -1,0 +1,27 @@
+# Python bytecode and local caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and dependency caches
+.venv/
+.pip-cache/
+.uv-cache/
+
+# Local app runtime state
+app/data/
+app/exports/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

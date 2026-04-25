@@ -76,9 +76,11 @@ MVP 限制：
 ## 4. 安装与启动
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.lock.txt
 streamlit run app/main.py
 ```
+
+如果需要新增或升级依赖，先修改 `requirements.txt`，再用 `uv pip compile requirements.txt -o requirements.lock.txt` 重新生成锁文件。
 
 Windows 下可以执行：
 

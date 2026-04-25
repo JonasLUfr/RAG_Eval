@@ -26,6 +26,72 @@ from app.storage import SQLiteStore
 
 st.set_page_config(page_title="RAG 评测工作台 MVP", layout="wide")
 
+try:
+    import pyarrow  # noqa: F401
+    _HAS_PYARROW = True
+except ImportError:
+    _HAS_PYARROW = False
+
+
+def _show_df(df: pd.DataFrame, *, hide_index: bool = True, column_config=None, **_) -> None:
+    """st.dataframe wrapper that falls back to a markdown table when PyArrow is unavailable."""
+    if _HAS_PYARROW:
+        st.dataframe(df, use_container_width=True, hide_index=hide_index, column_config=column_config)
+        return
+    if df.empty:
+        st.caption("暂无数据")
+        return
+    cols = list(df.columns)
+    lines = [
+        "| " + " | ".join(str(c) for c in cols) + " |",
+        "|" + "|".join([":---"] * len(cols)) + "|",
+    ]
+    for _, row in df.iterrows():
+        cells = [str(v).replace("|", "｜").replace("\n", " ")[:150] for v in row]
+        lines.append("| " + " | ".join(cells) + " |")
+    st.markdown("\n".join(lines))
+
+
+def _edit_df(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    """st.data_editor wrapper that keeps the app usable when PyArrow is unavailable."""
+    if _HAS_PYARROW:
+        return st.data_editor(df, **kwargs)
+    st.warning("PyArrow 无法加载，表格编辑暂时不可用；当前以只读表格显示。")
+    _show_df(df, hide_index=kwargs.get("hide_index", True))
+    return df.copy()
+
+
+def _show_bar_chart(df: pd.DataFrame, **kwargs) -> None:
+    """st.bar_chart wrapper that falls back to a matplotlib bar chart when PyArrow is unavailable."""
+    if _HAS_PYARROW:
+        st.bar_chart(df, **kwargs)
+        return
+    try:
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots()
+        df.plot(kind="bar", ax=ax)
+        ax.tick_params(axis="x", rotation=30)
+        st.pyplot(fig)
+        plt.close(fig)
+    except Exception:
+        _show_df(df.reset_index())
+
+
+def _show_altair(chart, **kwargs) -> None:
+    """st.altair_chart wrapper that falls back to _show_bar_chart when PyArrow is unavailable."""
+    if _HAS_PYARROW:
+        st.altair_chart(chart, **kwargs)
+        return
+    # Altair chart objects expose their data; extract and show as table
+    try:
+        data = chart.data
+        if hasattr(data, "to_dict"):
+            _show_df(data)
+        else:
+            st.caption("图表不可用（PyArrow 未加载）")
+    except Exception:
+        st.caption("图表不可用（PyArrow 未加载）")
+
 
 @st.cache_resource
 def get_runtime() -> tuple:
@@ -345,7 +411,7 @@ with tab_context:
 
     st.subheader("已保存材料")
     if base.uploaded_assets:
-        st.dataframe(
+        _show_df(
             pd.DataFrame(
                 [
                     {
@@ -535,7 +601,7 @@ with tab_testset:
         samples = store.list_test_cases(project.project_id)
         st.subheader(f"测试用例审核表：{len(samples)} 条")
         if samples:
-            edited_df = st.data_editor(
+            edited_df = _edit_df(
                 samples_to_dataframe(samples),
                 use_container_width=True,
                 num_rows="dynamic",
@@ -693,7 +759,7 @@ with tab_experiment:
                         results if auto_eval_import else None,
                     )
                     st.subheader("本次导入的 RAG 回答预览")
-                    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+                    _show_df(preview_df)
                     offer_dataframe_download(preview_df, f"{run.name}_rag_responses")
 
         else:
@@ -783,7 +849,7 @@ with tab_experiment:
                         results if auto_eval_api else None,
                     )
                     st.subheader("本次 API 返回结果预览")
-                    st.dataframe(preview_df, use_container_width=True, hide_index=True)
+                    _show_df(preview_df)
                     offer_dataframe_download(preview_df, f"{run.name}_rag_responses")
 
 
@@ -827,7 +893,7 @@ with tab_eval:
 
         with st.expander("各指标说明"):
             _info_rows = [{"指标": label, "说明": desc} for _, (label, desc) in METRIC_USER_INFO.items()]
-            st.dataframe(pd.DataFrame(_info_rows), use_container_width=True, hide_index=True)
+            _show_df(pd.DataFrame(_info_rows))
 
         st.subheader("评估方式")
         eval_mode = st.radio(
@@ -966,10 +1032,8 @@ with tab_eval:
             if metric_rows:
                 metric_df = pd.DataFrame(metric_rows)
                 st.subheader("指标概览")
-                st.dataframe(
+                _show_df(
                     metric_df,
-                    use_container_width=True,
-                    hide_index=True,
                     column_config={
                         "分数": st.column_config.ProgressColumn("分数", min_value=0, max_value=1, format="%.3f"),
                     },
@@ -977,7 +1041,7 @@ with tab_eval:
                 chart_df = pd.DataFrame(
                     [{"指标": r["指标"], "分数": r["分数"]} for r in metric_rows]
                 ).set_index("指标")
-                st.bar_chart(chart_df)
+                _show_bar_chart(chart_df)
 
             # ── 深度分析 ──────────────────────────────────────────────────
             st.subheader("深度分析")
@@ -1021,11 +1085,11 @@ with tab_eval:
                             )
                             .properties(height=300)
                         )
-                        st.altair_chart(_pie1, use_container_width=True)
+                        _show_altair(_pie1, use_container_width=True)
                     except Exception:
-                        st.bar_chart(_fd_df.set_index("失败类型")[["出现次数"]])
+                        _show_bar_chart(_fd_df.set_index("失败类型")[["出现次数"]])
                     st.caption("各失败类型占比：面积越大说明该类问题越集中，是优先改进方向。")
-                    st.dataframe(_fd_df[["失败类型", "出现次数", "说明"]], use_container_width=True, hide_index=True)
+                    _show_df(_fd_df[["失败类型", "出现次数", "说明"]])
                 else:
                     st.success("本次评估无失败标签，系统表现良好。")
 
@@ -1059,9 +1123,9 @@ with tab_eval:
                             )
                             .properties(height=300)
                         )
-                        st.altair_chart(_pie2, use_container_width=True)
+                        _show_altair(_pie2, use_container_width=True)
                     except Exception:
-                        st.bar_chart(pd.DataFrame({"低分": [_low], "中等": [_mid], "良好": [_high]}))
+                        _show_bar_chart(pd.DataFrame({"低分": [_low], "中等": [_mid], "良好": [_high]}))
                     _c1, _c2, _c3 = st.columns(3)
                     _c1.metric("🔴 低分（<0.4）", _low, help="需重点排查的样本")
                     _c2.metric("🟡 中等（0.4-0.65）", _mid, help="有改进空间的样本")
@@ -1108,14 +1172,12 @@ with tab_eval:
                             )
                             .properties(height=max(200, len(_tdf) * 40))
                         )
-                        st.altair_chart(_bar_h, use_container_width=True)
+                        _show_altair(_bar_h, use_container_width=True)
                     except Exception:
-                        st.bar_chart(_tdf.set_index("题型")[["平均得分"]])
+                        _show_bar_chart(_tdf.set_index("题型")[["平均得分"]])
                     st.caption("红色=偏低，黄色=一般，绿色=良好。得分偏低的题型是系统薄弱点。")
-                    st.dataframe(
+                    _show_df(
                         _tdf,
-                        use_container_width=True,
-                        hide_index=True,
                         column_config={
                             "平均得分": st.column_config.ProgressColumn("平均得分", min_value=0, max_value=1, format="%.3f"),
                         },
@@ -1129,11 +1191,11 @@ with tab_eval:
             display_df = user_df.copy()
             if "综合得分" in display_df.columns:
                 display_df = display_df[pd.to_numeric(display_df["综合得分"], errors="coerce").fillna(0) <= score_filter]
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            _show_df(display_df)
             offer_dataframe_download(user_df, f"{run.name}_evaluation_details")
 
             with st.expander("查看内部评分字段"):
-                st.dataframe(results_dataframe(results), use_container_width=True, hide_index=True)
+                _show_df(results_dataframe(results))
 
             st.subheader("手动修正失败标签")
             label_df = pd.DataFrame(
@@ -1146,7 +1208,7 @@ with tab_eval:
                     for result in results
                 ]
             )
-            edited_labels = st.data_editor(label_df, use_container_width=True, hide_index=True)
+            edited_labels = _edit_df(label_df, use_container_width=True, hide_index=True)
             if st.button("保存失败标签修正"):
                 for _, row in edited_labels.iterrows():
                     labels = [x.strip() for x in str(row["failure_labels"]).split(",") if x.strip()]
@@ -1157,7 +1219,7 @@ with tab_eval:
         elif responses:
             st.subheader("尚未评分的 RAG 回答")
             preview_df = response_review_dataframe(responses, samples)
-            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+            _show_df(preview_df)
             offer_dataframe_download(preview_df, f"{run.name}_rag_responses")
 
 
@@ -1177,9 +1239,9 @@ with tab_compare:
             summaries.append(summarize_run(run, responses, results))
         if summaries:
             compare_df = comparison_dataframe(summaries)
-            st.dataframe(compare_df, use_container_width=True)
-            st.bar_chart(compare_df.set_index("实验名称")[["平均总分", "成功率"]])
-            st.bar_chart(compare_df.set_index("实验名称")[["平均延迟(ms)", "估算成本"]])
+            _show_df(compare_df, hide_index=False)
+            _show_bar_chart(compare_df.set_index("实验名称")[["平均总分", "成功率"]])
+            _show_bar_chart(compare_df.set_index("实验名称")[["平均延迟(ms)", "估算成本"]])
             st.subheader("失败分布")
             for summary in summaries:
                 st.write(f"**{summary['name']}**")

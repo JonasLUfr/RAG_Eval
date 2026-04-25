@@ -2,14 +2,18 @@ $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
 if (-not (Test-Path ".venv\Scripts\python.exe")) {
-  Write-Host "未检测到 .venv，正在创建虚拟环境..."
+  Write-Host "No .venv detected; creating virtual environment..."
   uv venv .venv
 }
 
-Write-Host "正在安装/检查依赖..."
+Write-Host "Installing/checking dependencies..."
 $env:UV_CACHE_DIR = Join-Path $PSScriptRoot ".uv-cache"
-uv pip install -r requirements.txt --python .venv\Scripts\python.exe
+$requirementsFile = "requirements.txt"
+if (Test-Path "requirements.lock.txt") {
+  $requirementsFile = "requirements.lock.txt"
+  Write-Host "requirements.lock.txt detected; installing pinned dependencies."
+}
+uv pip install -r $requirementsFile --python .venv\Scripts\python.exe
 
-Write-Host "启动 RAG 评测工作台：http://localhost:8501"
+Write-Host "Starting RAG Eval Workbench: http://localhost:8501"
 .\.venv\Scripts\python.exe -m streamlit run app/main.py --server.port 8501 --server.address localhost
-
