@@ -56,36 +56,67 @@ class ExternalAPIConnector:
         headers = json.loads(self.connector_config.headers_json or "{}")
         payload = self._build_payload(sample)
         started = time.perf_counter()
-        try:
-            if self.connector_config.method.upper() == "GET":
-                response = requests.get(
-                    self.connector_config.endpoint,
-                    headers=headers,
-                    params=payload,
-                    timeout=self.config.request_timeout_seconds,
+        attempts = self.config.retry_times + 1
+        last_error: Exception | None = None
+        last_attempt = 0
+        for attempt in range(1, attempts + 1):
+            last_attempt = attempt
+            try:
+                response = self._send_request(headers, payload)
+                response.raise_for_status()
+                raw = response.json()
+                latency_ms = (time.perf_counter() - started) * 1000
+                parsed = self._parse_response(sample, raw, latency_ms)
+                parsed.raw_response = {**parsed.raw_response, "_attempts": attempt}
+                return parsed
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                if attempt >= attempts or not self._should_retry(exc):
+                    break
+                logger.warning(
+                    "外部 API 调用失败，准备重试 question_id=%s attempt=%s/%s error=%s",
+                    sample.question_id,
+                    attempt,
+                    attempts,
+                    exc,
                 )
-            else:
-                response = requests.post(
-                    self.connector_config.endpoint,
-                    headers=headers,
-                    json=payload,
-                    timeout=self.config.request_timeout_seconds,
-                )
-            response.raise_for_status()
-            raw = response.json()
-            latency_ms = (time.perf_counter() - started) * 1000
-            return self._parse_response(sample, raw, latency_ms)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("外部 API 调用失败 question_id=%s", sample.question_id)
-            return SystemResponse(
-                question_id=sample.question_id,
-                question=sample.question,
-                reference_answer=sample.reference_answer,
-                answer="",
-                success=False,
-                error=str(exc),
-                latency_ms=(time.perf_counter() - started) * 1000,
+                time.sleep(0.8 * attempt)
+        assert last_error is not None
+        logger.error("外部 API 调用最终失败 question_id=%s error=%s", sample.question_id, last_error)
+        latency_ms = (time.perf_counter() - started) * 1000
+        return SystemResponse(
+            question_id=sample.question_id,
+            question=sample.question,
+            reference_answer=sample.reference_answer,
+            answer="",
+            success=False,
+            error=str(last_error),
+            latency_ms=latency_ms,
+            raw_response={"_attempts": last_attempt, "_error": str(last_error)},
+        )
+
+    def _send_request(self, headers: dict[str, Any], payload: dict[str, Any]) -> requests.Response:
+        if self.connector_config.method.upper() == "GET":
+            return requests.get(
+                self.connector_config.endpoint,
+                headers=headers,
+                params=payload,
+                timeout=self.config.request_timeout_seconds,
             )
+        return requests.post(
+            self.connector_config.endpoint,
+            headers=headers,
+            json=payload,
+            timeout=self.config.request_timeout_seconds,
+        )
+
+    @staticmethod
+    def _should_retry(exc: Exception) -> bool:
+        if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+            return True
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            return exc.response.status_code == 429 or exc.response.status_code >= 500
+        return False
 
     def _build_payload(self, sample: EvalSample) -> dict[str, Any]:
         source = sample.to_dict()
@@ -133,4 +164,3 @@ class ExternalAPIConnector:
         if isinstance(value, list):
             return [str(x) for x in value]
         return [str(value)]
-

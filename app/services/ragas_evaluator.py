@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 _SYS = "你是严格的中文 RAG 评测裁判。只输出 JSON，不要输出任何解释。"
 
 
+class JudgeCallError(RuntimeError):
+    """Raised when the LLM judge cannot produce usable scoring data."""
+
+
 def _clamp(v: float) -> float:
     return max(0.0, min(1.0, v))
 
@@ -50,31 +54,35 @@ class RagasEvaluator:
         if not response.success or not answer.strip():
             return self._empty_result(response, "答案为空或请求失败。")
 
-        scores: dict[str, ScoreItem] = {}
-        scores["faithfulness"] = self._faithfulness(answer, contexts)
-        scores["correctness"] = self._correctness(question, answer, reference)
-        scores["relevance"] = self._relevance(question, answer)
-        scores["completeness"] = self._completeness(answer, reference)
-        faith = scores["faithfulness"].normalized_score
-        scores["hallucination_risk"] = ScoreItem(
-            raw_score=round(1 - faith, 4),
-            normalized_score=round(1 - faith, 4),
-            reason="幻觉风险 = 1 − 忠实性得分。",
-        )
-
-        if contexts:
-            scores["context_precision"] = self._context_precision(question, reference, contexts)
-            scores["context_recall"] = self._context_recall(reference, contexts)
-            scores["context_relevance"] = self._context_relevance(question, contexts)
-            scores["hit_rate"] = ScoreItem(
-                raw_score=scores["context_relevance"].raw_score,
-                normalized_score=scores["context_relevance"].normalized_score,
-                reason="上下文对问题的整体相关性（与上下文相关性一致）。",
+        try:
+            scores: dict[str, ScoreItem] = {}
+            scores["faithfulness"] = self._faithfulness(answer, contexts)
+            scores["correctness"] = self._correctness(question, answer, reference)
+            scores["relevance"] = self._relevance(question, answer)
+            scores["completeness"] = self._completeness(answer, reference)
+            faith = scores["faithfulness"].normalized_score
+            scores["hallucination_risk"] = ScoreItem(
+                raw_score=round(1 - faith, 4),
+                normalized_score=round(1 - faith, 4),
+                reason="幻觉风险 = 1 − 忠实性得分。",
             )
-            scores["evidence_coverage"] = self._evidence_coverage(expected_evidence or reference, contexts)
-        else:
-            for name in ["context_precision", "context_recall", "context_relevance", "hit_rate", "evidence_coverage"]:
-                scores[name] = ScoreItem(raw_score=0.0, normalized_score=0.0, reason="无检索上下文，跳过。")
+
+            if contexts:
+                scores["context_precision"] = self._context_precision(question, reference, contexts)
+                scores["context_recall"] = self._context_recall(reference, contexts)
+                scores["context_relevance"] = self._context_relevance(question, contexts)
+                scores["hit_rate"] = ScoreItem(
+                    raw_score=scores["context_relevance"].raw_score,
+                    normalized_score=scores["context_relevance"].normalized_score,
+                    reason="上下文对问题的整体相关性（与上下文相关性一致）。",
+                )
+                scores["evidence_coverage"] = self._evidence_coverage(expected_evidence or reference, contexts)
+            else:
+                for name in ["context_precision", "context_recall", "context_relevance", "hit_rate", "evidence_coverage"]:
+                    scores[name] = ScoreItem(raw_score=0.0, normalized_score=0.0, reason="无检索上下文，跳过。")
+        except JudgeCallError as exc:
+            logger.warning("RAGAS 评分失败 question_id=%s error=%s", response.question_id, exc)
+            return self._empty_result(response, f"RAGAS 评估器失败：{exc}", str(exc))
 
         agg = [
             (1 - scores["hallucination_risk"].normalized_score) if k == "hallucination_risk"
@@ -99,10 +107,12 @@ class RagasEvaluator:
 
     def _call(self, prompt: str) -> dict:
         try:
-            return self.llm.chat_json(_SYS, prompt, temperature=0.0)
+            data = self.llm.chat_json(_SYS, prompt, temperature=0.0)
         except Exception as exc:
-            logger.warning("RAGAS LLM 调用失败: %s", exc)
-            return {}
+            raise JudgeCallError(str(exc)) from exc
+        if not isinstance(data, dict):
+            raise JudgeCallError("LLM 裁判返回的 JSON 不是对象。")
+        return data
 
     def _faithfulness(self, answer: str, contexts: list[str]) -> ScoreItem:
         """Decompose answer into statements; verify each against contexts."""
@@ -237,7 +247,7 @@ class RagasEvaluator:
             labels.append("missing_evidence")
         return labels
 
-    def _empty_result(self, response: SystemResponse, reason: str) -> EvalResult:
+    def _empty_result(self, response: SystemResponse, reason: str, evaluator_error: str = "") -> EvalResult:
         scores = {
             name: ScoreItem(raw_score=0.0, normalized_score=0.0, reason=reason)
             for name in [
@@ -254,4 +264,6 @@ class RagasEvaluator:
             judge_model=self.llm.model,
             score_version=self.config.score_version,
             failure_labels=["cannot_judge"],
+            evaluation_status="judge_failed" if evaluator_error else "input_failed",
+            evaluator_error=evaluator_error,
         )

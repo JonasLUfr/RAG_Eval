@@ -156,6 +156,8 @@ class EvalResult:
     judge_model: str = ""
     score_version: str = "mvp-v1"
     failure_labels: list[str] = field(default_factory=list)
+    evaluation_status: str = "scored"
+    evaluator_error: str = ""
     created_at: str = field(default_factory=now_iso)
 
     def to_dict(self) -> dict[str, Any]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from html import escape
 from io import StringIO
 from pathlib import Path
 
@@ -24,7 +25,7 @@ from app.services.testset_generator import TestsetGenerator, TestsetLLMSettings
 from app.storage import SQLiteStore
 
 
-st.set_page_config(page_title="RAG 评测工作台 MVP", layout="wide")
+st.set_page_config(page_title="RAG_Eval 评测工作台", layout="wide")
 
 try:
     import pyarrow  # noqa: F401
@@ -91,6 +92,91 @@ def _show_altair(chart, **kwargs) -> None:
             st.caption("图表不可用（PyArrow 未加载）")
     except Exception:
         st.caption("图表不可用（PyArrow 未加载）")
+
+
+def _show_horizontal_bar_chart(
+    df: pd.DataFrame,
+    *,
+    category: str,
+    value: str,
+    color: str = "#0f6f68",
+    height_per_row: int = 34,
+    value_format: str = ".3f",
+) -> None:
+    """Render readable horizontal bars with labels that do not rotate vertically."""
+    if df.empty or category not in df.columns or value not in df.columns:
+        _show_df(df)
+        return
+    chart_df = df[[category, value]].copy()
+    chart_df[value] = pd.to_numeric(chart_df[value], errors="coerce").fillna(0)
+    chart_df[category] = chart_df[category].astype(str)
+    height = max(180, min(520, len(chart_df) * height_per_row + 42))
+    try:
+        import altair as alt
+
+        bar = (
+            alt.Chart(chart_df)
+            .mark_bar(cornerRadiusEnd=4, height=18)
+            .encode(
+                y=alt.Y(f"{category}:N", sort="-x", title="", axis=alt.Axis(labelLimit=260)),
+                x=alt.X(f"{value}:Q", title="", axis=alt.Axis(grid=True)),
+                color=alt.value(color),
+                tooltip=[alt.Tooltip(f"{category}:N"), alt.Tooltip(f"{value}:Q", format=value_format)],
+            )
+        )
+        label = (
+            alt.Chart(chart_df)
+            .mark_text(align="left", dx=6, color="#5b677a", fontSize=12)
+            .encode(
+                y=alt.Y(f"{category}:N", sort="-x", title=""),
+                x=alt.X(f"{value}:Q", title=""),
+                text=alt.Text(f"{value}:Q", format=value_format),
+            )
+        )
+        _show_altair((bar + label).properties(height=height), use_container_width=True)
+    except Exception:
+        _show_bar_chart(chart_df.set_index(category)[[value]])
+
+
+def _show_grouped_horizontal_bar_chart(
+    df: pd.DataFrame,
+    *,
+    category: str,
+    value_columns: list[str],
+    height_per_row: int = 42,
+) -> None:
+    """Render comparison metrics as grouped horizontal bars instead of hard-to-read vertical labels."""
+    available = [col for col in value_columns if col in df.columns]
+    if df.empty or category not in df.columns or not available:
+        _show_df(df)
+        return
+    chart_df = df[[category, *available]].copy()
+    for col in available:
+        chart_df[col] = pd.to_numeric(chart_df[col], errors="coerce").fillna(0)
+    long_df = chart_df.melt(category, var_name="指标", value_name="数值")
+    height = max(220, min(560, chart_df[category].nunique() * len(available) * height_per_row + 40))
+    try:
+        import altair as alt
+
+        chart = (
+            alt.Chart(long_df)
+            .mark_bar(cornerRadiusEnd=4)
+            .encode(
+                y=alt.Y(f"{category}:N", sort="-x", title="", axis=alt.Axis(labelLimit=320)),
+                x=alt.X("数值:Q", title=""),
+                color=alt.Color(
+                    "指标:N",
+                    scale=alt.Scale(range=["#0f6f68", "#6aaed6", "#d97706"]),
+                    legend=alt.Legend(title=""),
+                ),
+                yOffset=alt.YOffset("指标:N"),
+                tooltip=[alt.Tooltip(f"{category}:N"), alt.Tooltip("指标:N"), alt.Tooltip("数值:Q", format=".3f")],
+            )
+            .properties(height=height)
+        )
+        _show_altair(chart, use_container_width=True)
+    except Exception:
+        _show_bar_chart(chart_df.set_index(category)[available])
 
 
 @st.cache_resource
@@ -197,7 +283,7 @@ def response_review_dataframe(
 
 def overall_judge_summary(summary: dict, results: list) -> str:
     if not results:
-        return "当前实验还没有评分结果。请先执行评估。"
+        return "当前运行还没有评分结果。请先执行评估。"
     score = summary.get("avg_score", 0)
     success_rate = summary.get("success_rate", 0)
     failures = summary.get("failure_distribution", {})
@@ -213,7 +299,7 @@ def overall_judge_summary(summary: dict, results: list) -> str:
     else:
         level = "整体表现偏弱，建议先检查外部 RAG 返回字段映射、检索上下文质量、参考答案匹配和裁判配置。"
     return (
-        f"本次实验平均综合得分为 {score}，API 成功率为 {success_rate}。{level} "
+        f"本次运行平均综合得分为 {score}，API 成功率为 {success_rate}。{level} "
         f"主要失败集中在：{failure_text}。相对薄弱的指标是：{weak_text}。"
     )
 
@@ -253,6 +339,781 @@ def parse_mapping(text: str, fallback: dict[str, str]) -> dict[str, str]:
     except json.JSONDecodeError:
         st.warning("字段映射 JSON 无效，已使用默认映射。")
         return fallback
+
+
+def ui_escape(value) -> str:
+    return escape(str(value if value is not None else ""))
+
+
+def apply_app_theme() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --rag-primary: #14b8a6;
+            --rag-primary-dark: #0f766e;
+            --rag-primary-soft: #dff8f4;
+            --rag-bg: #f5f7fa;
+            --rag-surface: #ffffff;
+            --rag-border: #dde3ea;
+            --rag-border-soft: #e8edf3;
+            --rag-text: #111827;
+            --rag-sub: #5b677a;
+            --rag-muted: #8a96a8;
+            --rag-green: #16a34a;
+            --rag-green-soft: #eaf8ef;
+            --rag-amber: #d97706;
+            --rag-amber-soft: #fff4de;
+            --rag-red: #dc2626;
+            --rag-red-soft: #feecec;
+            --rag-blue: #2563eb;
+            --rag-blue-soft: #eaf1ff;
+            --rag-sidebar: #101827;
+        }
+        html, body, [class*="css"] {
+            font-family: Inter, "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+            font-size: 14px;
+            line-height: 1.55;
+        }
+        .stApp {
+            background: var(--rag-bg);
+            color: var(--rag-text);
+        }
+        .block-container {
+            padding-top: 0.9rem;
+            padding-bottom: 3rem;
+            max-width: 1400px;
+        }
+        header[data-testid="stHeader"] {
+            background: transparent;
+            height: 0;
+        }
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        [data-testid="stStatusWidget"] {
+            visibility: hidden;
+            height: 0;
+        }
+        [data-testid="stSidebar"] {
+            background: var(--rag-sidebar);
+            border-right: 1px solid #1e293b;
+        }
+        [data-testid="stSidebar"] * {
+            color: #e5edf7;
+        }
+        [data-testid="stSidebar"] .stSelectbox label,
+        [data-testid="stSidebar"] .stCaptionContainer {
+            color: #94a3b8 !important;
+        }
+        [data-testid="stSidebar"] [data-baseweb="select"] > div {
+            background: #111c2c;
+            border-color: #27364a;
+            border-radius: 8px;
+        }
+        h1, h2, h3 {
+            letter-spacing: 0;
+            color: var(--rag-text);
+            font-family: Inter, "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+        }
+        h1 {
+            font-size: 1.85rem !important;
+            line-height: 1.25 !important;
+        }
+        h2 {
+            font-size: 1.45rem !important;
+            line-height: 1.3 !important;
+        }
+        h3 {
+            font-size: 1.12rem !important;
+            line-height: 1.35 !important;
+        }
+        div[data-testid="stTabs"] button {
+            border-radius: 999px;
+            padding: 8px 14px;
+            color: var(--rag-sub);
+            font-size: 13px;
+        }
+        div[data-testid="stTabs"] button[aria-selected="true"] {
+            background: var(--rag-primary-soft);
+            color: var(--rag-primary-dark);
+            font-weight: 700;
+        }
+        div[data-testid="stTabs"] [data-baseweb="tab-highlight"] {
+            background-color: var(--rag-primary) !important;
+            height: 2px;
+        }
+        div[data-testid="stTabs"] [role="tablist"] {
+            gap: 6px;
+            border-bottom: 1px solid var(--rag-border);
+        }
+        div[data-testid="stMetric"] {
+            background: var(--rag-surface);
+            border: 1px solid var(--rag-border-soft);
+            border-radius: 10px;
+            padding: 18px 18px 16px;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+        }
+        div[data-testid="stMetricLabel"] p {
+            color: var(--rag-sub);
+            font-weight: 700;
+        }
+        div[data-testid="stMetricValue"] {
+            color: var(--rag-text);
+        }
+        .stButton > button,
+        .stDownloadButton > button,
+        div[data-testid="stFormSubmitButton"] button {
+            border-radius: 8px;
+            border: 1px solid var(--rag-border);
+            font-weight: 700;
+            min-height: 38px;
+            color: var(--rag-text) !important;
+            background: #ffffff;
+        }
+        .stButton > button[kind="primary"],
+        .stDownloadButton > button[kind="primary"],
+        div[data-testid="stFormSubmitButton"] button[kind="primary"] {
+            background: var(--rag-primary) !important;
+            border-color: var(--rag-primary) !important;
+            color: #ffffff !important;
+        }
+        .stButton > button[kind="primary"] *,
+        .stDownloadButton > button[kind="primary"] *,
+        div[data-testid="stFormSubmitButton"] button[kind="primary"] * {
+            color: #ffffff !important;
+        }
+        .stButton > button:hover,
+        .stDownloadButton > button:hover,
+        div[data-testid="stFormSubmitButton"] button:hover {
+            border-color: var(--rag-primary);
+            color: var(--rag-primary-dark) !important;
+        }
+        .stButton > button[kind="primary"]:hover,
+        .stDownloadButton > button[kind="primary"]:hover,
+        div[data-testid="stFormSubmitButton"] button[kind="primary"]:hover {
+            background: var(--rag-primary-dark) !important;
+            border-color: var(--rag-primary-dark) !important;
+            color: #ffffff !important;
+        }
+        .stButton > button:disabled,
+        .stDownloadButton > button:disabled,
+        div[data-testid="stFormSubmitButton"] button:disabled {
+            background: #e8edf3 !important;
+            border-color: #d7dee8 !important;
+            color: #7a8698 !important;
+            opacity: 1 !important;
+        }
+        .stButton > button:disabled *,
+        .stDownloadButton > button:disabled *,
+        div[data-testid="stFormSubmitButton"] button:disabled * {
+            color: #7a8698 !important;
+        }
+        [data-baseweb="input"] input,
+        [data-baseweb="textarea"] textarea,
+        [data-baseweb="select"] > div,
+        [data-testid="stNumberInput"] input {
+            font-size: 14px !important;
+            color: var(--rag-text) !important;
+        }
+        label, [data-testid="stWidgetLabel"] {
+            color: var(--rag-text) !important;
+            font-size: 13px !important;
+            font-weight: 600 !important;
+        }
+        [data-testid="stDataFrame"],
+        [data-testid="stDataEditor"] {
+            border: 1px solid var(--rag-border-soft);
+            border-radius: 10px;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.04);
+            overflow: hidden;
+        }
+        .rag-brand {
+            padding: 18px 14px 8px;
+            margin-bottom: 10px;
+        }
+        .rag-brand-title {
+            color: #ffffff;
+            font-size: 30px;
+            line-height: 1.1;
+            font-weight: 800;
+            margin: 0;
+            letter-spacing: -0.01em;
+        }
+        .rag-brand-subtitle {
+            color: #94a3b8;
+            font-size: 12px;
+            margin-top: 6px;
+        }
+        .rag-sidebar-card {
+            background: #111c2c;
+            border: 1px solid #27364a;
+            border-radius: 10px;
+            padding: 14px;
+            margin: 12px 0 18px;
+        }
+        .rag-sidebar-label {
+            color: #94a3b8;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: .04em;
+            margin-bottom: 6px;
+        }
+        .rag-sidebar-value {
+            color: #ffffff;
+            font-size: 14px;
+            font-weight: 700;
+        }
+        .rag-sidebar-meta {
+            color: #94a3b8;
+            font-size: 12px;
+            margin-top: 4px;
+        }
+        .rag-page-hero {
+            background: #ffffff;
+            border: 1px solid var(--rag-border-soft);
+            border-radius: 14px;
+            padding: 20px 24px;
+            margin: 4px 0 18px;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05);
+        }
+        .rag-eyebrow {
+            color: var(--rag-primary-dark);
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: .05em;
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+        .rag-page-hero h1.rag-page-title {
+            color: var(--rag-text);
+            font-size: 30px !important;
+            line-height: 1.2;
+            font-weight: 800;
+            margin: 0;
+        }
+        .rag-page-desc {
+            color: var(--rag-sub);
+            font-size: 14px;
+            line-height: 1.65;
+            margin-top: 8px;
+            max-width: 860px;
+        }
+        .rag-workflow {
+            background: #ffffff;
+            border: 1px solid var(--rag-border);
+            border-radius: 12px;
+            padding: 18px 18px 14px;
+            margin: 18px 0 0;
+        }
+        .rag-workflow-title {
+            color: var(--rag-text);
+            font-size: 15px;
+            font-weight: 800;
+            margin-bottom: 18px;
+        }
+        .rag-stepper {
+            display: grid;
+            grid-template-columns: repeat(6, minmax(0, 1fr));
+            align-items: start;
+            column-gap: 12px;
+        }
+        .rag-step {
+            position: relative;
+            text-align: center;
+            color: var(--rag-sub);
+            font-size: 13px;
+            font-weight: 600;
+        }
+        .rag-step:not(:last-child)::after {
+            content: "";
+            position: absolute;
+            top: 20px;
+            left: calc(50% + 30px);
+            right: calc(-50% + 30px);
+            height: 2px;
+            background: #d9e0e8;
+        }
+        .rag-step.done:not(:last-child)::after,
+        .rag-step.active:not(:last-child)::after {
+            background: #18c08f;
+        }
+        .rag-step-dot {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 42px;
+            height: 42px;
+            border-radius: 999px;
+            border: 3px solid #d9e0e8;
+            background: #f7f9fb;
+            color: #5b677a;
+            font-size: 20px;
+            font-weight: 800;
+            margin-bottom: 10px;
+            position: relative;
+            z-index: 1;
+        }
+        .rag-step.done .rag-step-dot {
+            background: #18c08f;
+            border-color: #18c08f;
+            color: #ffffff;
+        }
+        .rag-step.active .rag-step-dot {
+            background: var(--rag-primary-dark);
+            border-color: var(--rag-primary-dark);
+            color: #ffffff;
+        }
+        .rag-step.active .rag-step-label {
+            color: var(--rag-text);
+            font-weight: 800;
+        }
+        .rag-section-card {
+            background: var(--rag-surface);
+            border: 1px solid var(--rag-border-soft);
+            border-radius: 12px;
+            padding: 18px 20px;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05);
+            margin: 12px 0 18px;
+        }
+        .rag-section-title {
+            color: var(--rag-text);
+            font-size: 17px;
+            font-weight: 800;
+            margin-bottom: 4px;
+        }
+        .rag-section-desc {
+            color: var(--rag-sub);
+            font-size: 13px;
+            line-height: 1.55;
+        }
+        .rag-kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 14px;
+            margin: 10px 0 18px;
+        }
+        .rag-kpi {
+            background: var(--rag-surface);
+            border: 1px solid var(--rag-border-soft);
+            border-radius: 12px;
+            padding: 18px;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05);
+        }
+        .rag-kpi-label {
+            color: var(--rag-sub);
+            font-size: 12px;
+            font-weight: 800;
+        }
+        .rag-kpi-value {
+            color: var(--rag-text);
+            font-size: 28px;
+            line-height: 1.15;
+            font-weight: 800;
+            margin-top: 8px;
+        }
+        .rag-kpi-note {
+            color: var(--rag-muted);
+            font-size: 12px;
+            margin-top: 8px;
+        }
+        .rag-badge {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 4px 9px;
+            font-size: 12px;
+            font-weight: 800;
+            margin-right: 6px;
+            white-space: nowrap;
+        }
+        .rag-badge.green { background: var(--rag-green-soft); color: var(--rag-green); }
+        .rag-badge.amber { background: var(--rag-amber-soft); color: var(--rag-amber); }
+        .rag-badge.red { background: var(--rag-red-soft); color: var(--rag-red); }
+        .rag-badge.blue { background: var(--rag-blue-soft); color: var(--rag-blue); }
+        .rag-actions {
+            color: var(--rag-sub);
+            font-size: 13px;
+            line-height: 1.7;
+        }
+        .rag-option-card {
+            background: #ffffff;
+            border: 2px solid var(--rag-border);
+            border-radius: 10px;
+            padding: 16px 18px;
+            margin: 10px 0;
+        }
+        .rag-option-card.active {
+            background: #f0faf8;
+            border-color: var(--rag-primary-dark);
+        }
+        .rag-option-title {
+            color: var(--rag-text);
+            font-size: 15px;
+            font-weight: 800;
+            margin-bottom: 4px;
+        }
+        .rag-option-desc {
+            color: var(--rag-sub);
+            font-size: 13px;
+            line-height: 1.55;
+        }
+        .rag-export-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 24px;
+            margin: 18px 0;
+        }
+        .rag-export-card {
+            background: #ffffff;
+            border: 2px solid var(--rag-border);
+            border-radius: 12px;
+            padding: 28px;
+            min-height: 270px;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05);
+        }
+        .rag-export-card.featured {
+            border-color: #18c08f;
+        }
+        .rag-export-head {
+            display: flex;
+            align-items: flex-start;
+            gap: 16px;
+            margin-bottom: 14px;
+        }
+        .rag-export-icon {
+            width: 54px;
+            height: 54px;
+            border-radius: 10px;
+            background: #e0f2ef;
+            color: var(--rag-primary-dark);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 25px;
+            font-weight: 800;
+        }
+        .rag-export-title {
+            color: var(--rag-text);
+            font-size: 20px;
+            font-weight: 800;
+            margin-bottom: 8px;
+        }
+        .rag-export-desc {
+            color: var(--rag-sub);
+            font-size: 14px;
+            line-height: 1.55;
+        }
+        .rag-export-list {
+            background: #f8fafc;
+            border-radius: 8px;
+            padding: 14px 16px;
+            color: var(--rag-sub);
+            font-size: 13px;
+            line-height: 1.65;
+            margin: 16px 0;
+        }
+        .rag-button-row {
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+            align-items: center;
+        }
+        @media (max-width: 900px) {
+            .rag-export-grid { grid-template-columns: 1fr; }
+            .rag-stepper { grid-template-columns: repeat(3, minmax(0, 1fr)); row-gap: 18px; }
+            .rag-step::after { display: none; }
+        }
+        .rag-sidebar-about {
+            color: #b6c4d6;
+            font-size: 12px;
+            line-height: 1.65;
+            margin: 8px 14px 16px;
+        }
+        .rag-sidebar-footer {
+            border-top: 1px solid #27364a;
+            color: #a8b3c3;
+            font-size: 10.5px;
+            line-height: 1.55;
+            margin: 0 14px;
+            padding-top: 10px;
+            position: fixed;
+            bottom: 14px;
+            left: 14px;
+            width: 210px;
+            opacity: 0.78;
+        }
+        .rag-sidebar-footer div {
+            color: #a8b3c3;
+            font-size: 10.5px;
+            font-weight: 500;
+        }
+        @media (max-width: 1100px) {
+            .rag-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        }
+        @media (max-width: 720px) {
+            .rag-kpi-grid { grid-template-columns: 1fr; }
+            .block-container { padding-left: 1rem; padding-right: 1rem; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_page_header(title: str, description: str, step: int | None = None) -> None:
+    workflow = [
+        "项目设置",
+        "测试问题集",
+        "运行测试",
+        "评估分析",
+        "实验对比",
+        "导出中心",
+    ]
+    step_html = ""
+    if step is not None:
+        parts = []
+        for index, label in enumerate(workflow, start=1):
+            state = "active" if index == step else "done" if index < step else ""
+            symbol = "✓" if index < step else "○"
+            parts.append(
+                f'<div class="rag-step {state}">'
+                f'<div class="rag-step-dot">{symbol}</div>'
+                f'<div class="rag-step-label">{ui_escape(label)}</div>'
+                "</div>"
+            )
+        step_html = (
+            '<div class="rag-workflow"><div class="rag-workflow-title">评测流程</div>'
+            f'<div class="rag-stepper">{"".join(parts)}</div></div>'
+        )
+    html = (
+        '<div class="rag-page-hero">'
+        '<div class="rag-eyebrow">RAG_Eval 工作区</div>'
+        f'<h1 class="rag-page-title">{ui_escape(title)}</h1>'
+        f'<div class="rag-page-desc">{ui_escape(description)}</div>'
+        f"{step_html}"
+        "</div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def render_section_intro(title: str, description: str) -> None:
+    html = (
+        '<div class="rag-section-card">'
+        f'<div class="rag-section-title">{ui_escape(title)}</div>'
+        f'<div class="rag-section-desc">{ui_escape(description)}</div>'
+        "</div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def render_kpi_cards(cards: list[tuple[str, str, str]]) -> None:
+    card_html = "".join(
+        (
+            '<div class="rag-kpi">'
+            f'<div class="rag-kpi-label">{ui_escape(label)}</div>'
+            f'<div class="rag-kpi-value">{ui_escape(value)}</div>'
+            f'<div class="rag-kpi-note">{ui_escape(note)}</div>'
+            "</div>"
+        )
+        for label, value, note in cards
+    )
+    st.markdown(f'<div class="rag-kpi-grid">{card_html}</div>', unsafe_allow_html=True)
+
+
+def render_eval_mode_cards(eval_mode: str) -> None:
+    items = [
+        (
+            "rule",
+            "规则评分",
+            "快速，基于字符重叠和关键词匹配，适合初筛，准确性有限。",
+        ),
+        (
+            "embedding",
+            "语义嵌入相似度（推荐）",
+            "本地运行，无需 API，基于 embedding 模型计算语义相似度，准确性较好。",
+        ),
+        (
+            "ragas",
+            "RAGAS 框架评估",
+            "最准确，覆盖 faithfulness、relevancy 等维度，每条样本约 8 次 LLM 调用。",
+        ),
+    ]
+    html = "".join(
+        (
+            f'<div class="rag-option-card {"active" if key == eval_mode else ""}">'
+            f'<div class="rag-option-title">{"● " if key == eval_mode else "○ "}{ui_escape(title)}</div>'
+            f'<div class="rag-option-desc">{ui_escape(desc)}</div>'
+            "</div>"
+        )
+        for key, title, desc in items
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def render_export_cards() -> None:
+    st.markdown(
+        """
+        <div class="rag-export-grid">
+          <div class="rag-export-card featured">
+            <div class="rag-export-head">
+              <div class="rag-export-icon">▦</div>
+              <div>
+                <div class="rag-export-title">导出 Excel 数据</div>
+                <div class="rag-export-desc">包含多个工作表，适合工程复盘、样本排查和二次分析。</div>
+              </div>
+            </div>
+            <div class="rag-export-list">
+              包含工作表：<br>
+              • experiment_overview - 实验概览<br>
+              • sample_details - 样本明细<br>
+              • metric_summary - 指标汇总<br>
+              • failure_cases - 失败案例<br>
+              • question_type_distribution - 题型分布
+            </div>
+          </div>
+          <div class="rag-export-card">
+            <div class="rag-export-head">
+              <div class="rag-export-icon">▤</div>
+              <div>
+                <div class="rag-export-title">生成 Markdown / PDF 报告</div>
+                <div class="rag-export-desc">生成专业评测报告，适合项目汇报、评审和阶段性归档。</div>
+              </div>
+            </div>
+            <div class="rag-export-list">
+              报告结构：<br>
+              • 项目摘要<br>
+              • 实验概况与总体指标<br>
+              • 题型分布与得分分析<br>
+              • 代表性失败案例<br>
+              • 实验对比<br>
+              • 改进建议
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_sidebar_brand() -> None:
+    st.sidebar.markdown(
+        '<div class="rag-brand"><div class="rag-brand-title">RAG_Eval</div>'
+        '<div class="rag-brand-subtitle">RAG / 检索生成评测平台</div></div>'
+        '<div class="rag-sidebar-about">'
+        '用于评估 Agent 的 RAG、检索生成与问答系统表现，支持测试集管理、批量运行、评分分析和报告导出。'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_sidebar_footer() -> None:
+    st.sidebar.markdown(
+        '<div class="rag-sidebar-footer">'
+        '<div>版本：1.0</div>'
+        '<div>开发人员：JonasLu.com</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_sidebar_context(project: ProjectContext | None) -> None:
+    if project:
+        samples = store.list_test_cases(project.project_id)
+        approved = store.list_test_cases(project.project_id, approved_only=True)
+        runs = store.list_experiments(project.project_id)
+        st.sidebar.markdown(
+            '<div class="rag-sidebar-card">'
+            '<div class="rag-sidebar-label">当前项目</div>'
+            f'<div class="rag-sidebar-value">{ui_escape(project.name)}</div>'
+            f'<div class="rag-sidebar-meta">{len(samples)} 个测试用例 · {len(approved)} 个已通过 · {len(runs)} 次运行</div>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.sidebar.markdown(
+            '<div class="rag-sidebar-card"><div class="rag-sidebar-label">当前项目</div>'
+            '<div class="rag-sidebar-value">尚未创建</div>'
+            '<div class="rag-sidebar-meta">先完成项目设置，再生成测试集。</div></div>',
+            unsafe_allow_html=True,
+        )
+
+
+def render_dashboard(project: ProjectContext | None) -> None:
+    render_page_header(
+        "评测总览",
+        "集中查看项目状态、测试集准备度、测试运行进展和下一步动作。",
+        None,
+    )
+    if not project:
+        st.info("暂无项目。请先进入“项目设置”创建项目，并补充背景、业务规则和评测目标。")
+        render_kpi_cards([
+            ("项目状态", "未创建", "需要先建立评测上下文"),
+            ("测试用例", "0", "生成或上传后进入审核"),
+            ("测试运行", "0", "暂无历史记录"),
+            ("评估结果", "未评分", "等待系统输出"),
+        ])
+        return
+
+    samples = store.list_test_cases(project.project_id)
+    approved = store.list_test_cases(project.project_id, approved_only=True)
+    runs = store.list_experiments(project.project_id)
+    latest_run = runs[0] if runs else None
+    latest_responses = store.list_system_responses(latest_run.run_id) if latest_run else []
+    latest_results = store.list_eval_results(latest_run.run_id) if latest_run else []
+    latest_summary = summarize_run(latest_run, latest_responses, latest_results) if latest_run else {}
+    avg_score = latest_summary.get("avg_score", 0) if latest_results else "未评分"
+    success_rate = latest_summary.get("success_rate", 0) if latest_responses else "暂无"
+
+    render_kpi_cards([
+        ("测试用例", str(len(samples)), f"{len(approved)} 个已通过，可运行测试"),
+        ("测试运行", str(len(runs)), latest_run.name if latest_run else "尚未创建运行记录"),
+        ("平均综合得分", str(avg_score), "最近一次已评分运行" if latest_results else "等待评估结果"),
+        ("API 成功率", str(success_rate), "最近一次系统输出统计" if latest_responses else "暂无系统输出"),
+    ])
+
+    next_actions = []
+    if not samples:
+        next_actions.append("生成或上传测试问题集，并进入审核表。")
+    elif not approved:
+        next_actions.append("将可用测试用例标记为“已通过”。")
+    elif not runs:
+        next_actions.append("创建历史结果导入或外部 API 运行测试。")
+    elif latest_responses and not latest_results:
+        next_actions.append("进入“评估与失败分析”，选择评估引擎并开始评分。")
+    else:
+        next_actions.append("查看失败标签和低分样本，导出阶段报告。")
+    if project.uploaded_assets:
+        next_actions.append(f"已保存 {len(project.uploaded_assets)} 份项目材料，可继续补充业务规则。")
+    else:
+        next_actions.append("建议上传小型业务材料，让测试集生成更贴近真实场景。")
+
+    st.markdown(
+        '<div class="rag-section-card"><div class="rag-section-title">下一步建议</div>'
+        f'<div class="rag-actions">{"<br>".join(ui_escape(item) for item in next_actions)}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+    if runs:
+        rows = []
+        for run in runs[:5]:
+            responses = store.list_system_responses(run.run_id)
+            results = store.list_eval_results(run.run_id)
+            summary = summarize_run(run, responses, results)
+            rows.append(
+                {
+                    "运行名称": run.name,
+                    "模式": run.mode,
+                    "样本数": summary.get("samples", 0),
+                    "平均总分": summary.get("avg_score", 0) if results else "未评分",
+                    "成功率": summary.get("success_rate", 0) if responses else "暂无",
+                    "平均延迟(ms)": summary.get("avg_latency_ms", 0),
+                }
+            )
+        render_section_intro("最近运行", "用于快速判断当前项目是否已经具备可分析结果。")
+        _show_df(pd.DataFrame(rows), hide_index=True)
+    else:
+        st.info("暂无运行记录。完成测试用例审核后，可在“运行测试”中导入历史结果或调用外部 RAG API。")
 
 
 def current_project_selector() -> ProjectContext | None:
@@ -315,18 +1176,27 @@ def evaluate_run_now(
     return results, summary
 
 
-st.sidebar.title("RAG 评测工作台")
-st.sidebar.caption("本地中文 MVP，不内置检索引擎。")
+apply_app_theme()
+render_sidebar_brand()
 project = current_project_selector()
+render_sidebar_context(project)
+render_sidebar_footer()
 
-tab_context, tab_testset, tab_experiment, tab_eval, tab_compare, tab_export = st.tabs(
-    ["项目设置", "测试问题集", "实验运行", "评估与失败分析", "实验对比", "导出中心"]
+tab_dashboard, tab_context, tab_testset, tab_experiment, tab_eval, tab_compare, tab_export = st.tabs(
+    ["总览", "项目设置", "测试问题集", "运行测试", "评估与失败分析", "实验对比", "导出中心"]
 )
 
 
+with tab_dashboard:
+    render_dashboard(project)
+
+
 with tab_context:
-    st.header("项目设置")
-    st.caption("这里只需要交代项目背景和上传少量材料，让 LLM 后续能理解要评测什么。")
+    render_page_header(
+        "项目设置",
+        "用自然语言沉淀项目背景、被评测系统、评测目标和业务规则，为测试集生成和报告导出提供上下文。",
+        1,
+    )
     create_new = st.checkbox("新建项目", value=False)
     base = ProjectContext(name="新项目") if create_new or project is None else project
 
@@ -434,11 +1304,18 @@ with tab_context:
 
 
 with tab_testset:
-    st.header("测试问题集")
+    render_page_header(
+        "测试问题集",
+        "通过 LLM 生成或上传已有题集，并在审核表中完成编辑、去重、删除和批准。",
+        2,
+    )
     if not project:
         st.info("请先创建项目设置。")
     else:
-        st.caption("你可以让 LLM 基于项目背景和上传材料生成测试问题，也可以直接上传已经做好的测试问题集。")
+        render_section_intro(
+            "题集来源",
+            "两条路径会进入同一个审核表：生成适合探索，上传适合复用已有人工题集。",
+        )
         generation_mode = st.radio(
             "测试问题集来源",
             ["使用 LLM 生成", "上传已有测试问题集"],
@@ -529,7 +1406,10 @@ with tab_testset:
                 value=project.question_type_instructions,
                 height=90,
             )
-            if st.button("调用 LLM 生成测试问题集", type="primary"):
+            _gen_spacer, _gen_col = st.columns([4, 1.4])
+            with _gen_col:
+                generate_cases = st.button("调用 LLM 生成测试问题集", type="primary", use_container_width=True)
+            if generate_cases:
                 api_key = api_key_input or config.llm_api_key
                 if not api_base or not api_key or not model_name:
                     st.error("请填写 API Base、API Key 和模型名。")
@@ -673,14 +1553,22 @@ with tab_testset:
 
 
 with tab_experiment:
-    st.header("实验运行与历史结果导入")
+    render_page_header(
+        "运行测试与结果导入",
+        "导入已有 RAG 回答，或批量调用外部 RAG API，形成可评分的测试运行记录。",
+        3,
+    )
     if not project:
         st.info("请先创建项目。")
     else:
         approved_samples = store.list_test_cases(project.project_id, approved_only=True)
-        st.caption(f"当前已通过测试用例：{len(approved_samples)} 条；MVP 默认单次评估上限：{config.default_max_eval_questions} 条。")
+        render_kpi_cards([
+            ("已通过测试用例", str(len(approved_samples)), "外部 API 模式将使用这些题目"),
+            ("单次评估上限", str(config.default_max_eval_questions), "用于控制成本和运行时间"),
+            ("最大生成题数", str(config.default_max_generated_questions), "测试集生成配置上限"),
+        ])
         st.info("测试问题集已自动保存。外部 API 模式会直接使用上一步审核通过的测试题，无需再次上传。")
-        run_name = st.text_input("实验名称", value="MVP 实验运行")
+        run_name = st.text_input("运行名称", value="测试运行")
         run_limit = st.number_input(
             "本次运行/导入样本上限",
             min_value=1,
@@ -718,7 +1606,10 @@ with tab_experiment:
                         indent=2,
                     ),
                 )
-            if st.button("创建实验并保存历史结果", type="primary"):
+            _import_spacer, _import_col = st.columns([4, 1.4])
+            with _import_col:
+                create_import_run = st.button("创建运行并保存历史结果", type="primary", use_container_width=True)
+            if create_import_run:
                 if uploaded_results:
                     raw_df = read_uploaded_table(uploaded_results.name, uploaded_results.getvalue())
                 elif pasted.strip().startswith(("[", "{")):
@@ -748,11 +1639,11 @@ with tab_experiment:
                         with st.spinner("正在根据导入的 RAG 回答执行评估..."):
                             results, summary = evaluate_run_now(run, responses, approved_samples)
                         st.success(
-                            f"实验已创建，保存 {len(responses)} 条系统输出，并完成 {len(results)} 条评分。请到“评估与失败分析”查看详情。"
+                            f"运行记录已创建，保存 {len(responses)} 条系统输出，并完成 {len(results)} 条评分。请到“评估与失败分析”查看详情。"
                         )
                         st.info(overall_judge_summary(summary, results))
                     else:
-                        st.success(f"实验已创建，保存 {len(responses)} 条系统输出。下一步到“评估与失败分析”执行评分。")
+                        st.success(f"运行记录已创建，保存 {len(responses)} 条系统输出。下一步到“评估与失败分析”执行评分。")
                     preview_df = response_review_dataframe(
                         responses,
                         approved_samples,
@@ -794,7 +1685,10 @@ with tab_experiment:
                     ),
                     height=150,
                 )
-            if st.button("验证并批量调用外部 API", type="primary"):
+            _api_spacer, _api_col = st.columns([4, 1.4])
+            with _api_col:
+                run_external_api = st.button("验证并批量调用外部 API", type="primary", use_container_width=True)
+            if run_external_api:
                 if not approved_samples:
                     st.error("没有已通过测试题。请先在“测试问题集”中审核并标记为已通过。")
                     st.stop()
@@ -838,11 +1732,11 @@ with tab_experiment:
                         with st.spinner("API 响应已保存，正在执行评估..."):
                             results, summary = evaluate_run_now(run, responses, selected_samples)
                         st.success(
-                            f"外部 API 实验已保存，获得 {len(responses)} 条响应，并完成 {len(results)} 条评分。请到“评估与失败分析”查看详情。"
+                            f"外部 API 运行已保存，获得 {len(responses)} 条响应，并完成 {len(results)} 条评分。请到“评估与失败分析”查看详情。"
                         )
                         st.info(overall_judge_summary(summary, results))
                     else:
-                        st.success(f"外部 API 实验已保存，获得 {len(responses)} 条响应。下一步到“评估与失败分析”执行评分。")
+                        st.success(f"外部 API 运行已保存，获得 {len(responses)} 条响应。下一步到“评估与失败分析”执行评分。")
                     preview_df = response_review_dataframe(
                         responses,
                         selected_samples,
@@ -854,13 +1748,17 @@ with tab_experiment:
 
 
 with tab_eval:
-    st.header("评估引擎与失败分析")
+    render_page_header(
+        "评估与失败分析",
+        "把系统输出转成可执行结论：综合得分、指标短板、失败标签、低分样本和人工修正。",
+        4,
+    )
     st.warning(
         "LLM 裁判可能产生较高费用。1000 条样本会消耗大量 tokens，因为裁判 prompt 往往包含问题、答案、参考答案和长上下文。建议先小批量验证。"
     )
     runs = store.list_experiments(project.project_id if project else None)
     if not runs:
-        st.info("暂无实验，请先在“实验运行”中创建。")
+        st.info("暂无运行记录，请先在“运行测试”中创建。")
     else:
         run_options = {f"{r.name} ({r.run_id})": r.run_id for r in runs}
         run_id = st.selectbox("选择实验", list(run_options.keys()), key="eval_run")
@@ -907,6 +1805,7 @@ with tab_eval:
             key="eval_mode_radio",
             index=1,
         )
+        render_eval_mode_cards(eval_mode)
 
         eval_embedding_model = None
         _ragas_base = _ragas_key = _ragas_model = ""
@@ -958,7 +1857,10 @@ with tab_eval:
                 "建议仅用于快速初筛，正式评估请选择语义嵌入或 RAGAS。"
             )
 
-        if st.button("开始/重新评估", type="primary"):
+        _btn_spacer, _btn_col = st.columns([5, 1.4])
+        with _btn_col:
+            start_eval = st.button("开始 / 重新评估", type="primary", use_container_width=True)
+        if start_eval:
             _ok = True
             if eval_mode == "ragas" and not (_ragas_base and _ragas_key):
                 st.error("请填写 RAGAS 的 API Base 和 API Key。")
@@ -1014,11 +1916,13 @@ with tab_eval:
             st.info(overall_judge_summary(summary, results))
 
             metric_summary = summary.get("metric_summary", {})
-            col_s1, col_s2, col_s3, col_s4 = st.columns(4)
-            col_s1.metric("平均综合得分", summary.get("avg_score", 0))
-            col_s2.metric("成功率", summary.get("success_rate", 0))
-            col_s3.metric("平均延迟(ms)", summary.get("avg_latency_ms", 0))
-            col_s4.metric("估算成本", summary.get("estimated_cost", 0))
+            high_risk_count = sum(1 for result in results if result.normalized_score < 0.4)
+            render_kpi_cards([
+                ("平均综合得分", str(summary.get("avg_score", 0)), "最近一次评分结果"),
+                ("成功率", str(summary.get("success_rate", 0)), "系统输出成功占比"),
+                ("平均延迟(ms)", str(summary.get("avg_latency_ms", 0)), "来自系统响应字段"),
+                ("高风险样本", str(high_risk_count), "综合得分低于 0.4"),
+            ])
 
             metric_rows = []
             for name, value in metric_summary.items():
@@ -1040,8 +1944,8 @@ with tab_eval:
                 )
                 chart_df = pd.DataFrame(
                     [{"指标": r["指标"], "分数": r["分数"]} for r in metric_rows]
-                ).set_index("指标")
-                _show_bar_chart(chart_df)
+                )
+                _show_horizontal_bar_chart(chart_df, category="指标", value="分数")
 
             # ── 深度分析 ──────────────────────────────────────────────────
             st.subheader("深度分析")
@@ -1151,30 +2055,7 @@ with tab_eval:
                         .rename(columns={"mean": "平均得分", "count": "样本数"})
                         .sort_values("平均得分")
                     )
-                    try:
-                        import altair as alt
-                        _bar_h = (
-                            alt.Chart(_tdf)
-                            .mark_bar()
-                            .encode(
-                                x=alt.X("平均得分:Q", scale=alt.Scale(domain=[0, 1]), title="平均综合得分"),
-                                y=alt.Y("题型:N", sort="-x", title=""),
-                                color=alt.condition(
-                                    alt.datum["平均得分"] >= 0.65,
-                                    alt.value("#22c55e"),
-                                    alt.condition(
-                                        alt.datum["平均得分"] >= 0.4,
-                                        alt.value("#f59e0b"),
-                                        alt.value("#ef4444"),
-                                    ),
-                                ),
-                                tooltip=["题型:N", "平均得分:Q", "样本数:Q"],
-                            )
-                            .properties(height=max(200, len(_tdf) * 40))
-                        )
-                        _show_altair(_bar_h, use_container_width=True)
-                    except Exception:
-                        _show_bar_chart(_tdf.set_index("题型")[["平均得分"]])
+                    _show_horizontal_bar_chart(_tdf, category="题型", value="平均得分")
                     st.caption("红色=偏低，黄色=一般，绿色=良好。得分偏低的题型是系统薄弱点。")
                     _show_df(
                         _tdf,
@@ -1184,6 +2065,27 @@ with tab_eval:
                     )
                 else:
                     st.info("测试用例需填写题型字段才能展示此图。")
+
+            low_score_rows = []
+            response_by_id = {response.response_id: response for response in responses}
+            for result in sorted(results, key=lambda item: item.normalized_score)[:8]:
+                response = response_by_id.get(result.response_id)
+                if not response:
+                    continue
+                low_score_rows.append(
+                    {
+                        "原问题": response.question,
+                        "综合得分": result.normalized_score,
+                        "失败标签": ",".join(result.failure_labels),
+                        "裁判理由": result.judge_reason,
+                    }
+                )
+            if low_score_rows:
+                render_section_intro(
+                    "低分样本队列",
+                    "优先复核这些样本：它们通常对应检索缺失、无依据回答、规则错误或参考答案不完整。",
+                )
+                _show_df(pd.DataFrame(low_score_rows))
 
             st.subheader("样本级评估明细")
             user_df = response_review_dataframe(responses, samples, results)
@@ -1224,10 +2126,14 @@ with tab_eval:
 
 
 with tab_compare:
-    st.header("实验对比")
+    render_page_header(
+        "实验对比",
+        "对比不同实验的质量、成功率、延迟、成本和失败分布，辅助判断改动是否真的有效。",
+        5,
+    )
     runs = store.list_experiments(project.project_id if project else None)
     if len(runs) < 2:
-        st.info("至少需要两个实验运行才能对比。")
+        st.info("至少需要两个运行记录才能对比。")
     else:
         options = {f"{r.name} ({r.run_id})": r.run_id for r in runs}
         selected = st.multiselect("选择至少两个实验", list(options.keys()), default=list(options.keys())[:2])
@@ -1240,8 +2146,10 @@ with tab_compare:
         if summaries:
             compare_df = comparison_dataframe(summaries)
             _show_df(compare_df, hide_index=False)
-            _show_bar_chart(compare_df.set_index("实验名称")[["平均总分", "成功率"]])
-            _show_bar_chart(compare_df.set_index("实验名称")[["平均延迟(ms)", "估算成本"]])
+            render_section_intro("质量对比", "横向条形图更适合中文实验名称，便于快速比较平均总分和成功率。")
+            _show_grouped_horizontal_bar_chart(compare_df, category="实验名称", value_columns=["平均总分", "成功率"])
+            render_section_intro("成本与性能对比", "平均延迟和估算成本量纲不同，建议分别关注排序和异常值。")
+            _show_grouped_horizontal_bar_chart(compare_df, category="实验名称", value_columns=["平均延迟(ms)", "估算成本"])
             st.subheader("失败分布")
             for summary in summaries:
                 st.write(f"**{summary['name']}**")
@@ -1249,7 +2157,11 @@ with tab_compare:
 
 
 with tab_export:
-    st.header("导出中心")
+    render_page_header(
+        "导出中心",
+        "将评测结果打包为工程复盘用 Excel，或生成面向 PM、导师和客户的 Markdown 报告。",
+        6,
+    )
     runs = store.list_experiments(project.project_id if project else None)
     if not project or not runs:
         st.info("请先完成项目和实验。")
@@ -1275,16 +2187,23 @@ with tab_export:
                 )
             )
 
-        col_excel, col_md = st.columns(2)
+        render_export_cards()
+        _exp_spacer, col_excel, col_md = st.columns([2.6, 1, 1])
         with col_excel:
-            if st.button("一键导出 Excel", type="primary"):
+            if st.button("一键导出 Excel", type="primary", use_container_width=True):
                 path = exporter.export_excel(project, run, samples, responses, results, summary)
                 st.success(f"Excel 已导出：{path}")
                 with Path(path).open("rb") as file:
-                    st.download_button("下载 Excel", data=file, file_name=Path(path).name)
+                    st.download_button("下载 Excel", data=file, file_name=Path(path).name, use_container_width=True)
         with col_md:
-            if st.button("一键导出 Markdown", type="primary"):
+            if st.button("一键导出 Markdown", type="primary", use_container_width=True):
                 path = exporter.export_markdown(project, run, samples, responses, results, summary, comparison_rows)
                 st.success(f"Markdown 已导出：{path}")
                 with Path(path).open("rb") as file:
-                    st.download_button("下载 Markdown", data=file, file_name=Path(path).name, mime="text/markdown")
+                    st.download_button(
+                        "下载 Markdown",
+                        data=file,
+                        file_name=Path(path).name,
+                        mime="text/markdown",
+                        use_container_width=True,
+                    )
