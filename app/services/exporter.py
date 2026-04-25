@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -8,9 +7,6 @@ import pandas as pd
 
 from app.core.config import AppConfig
 from app.models import EvalResult, EvalSample, ExperimentRun, ProjectContext, SystemResponse
-
-
-logger = logging.getLogger(__name__)
 
 
 class ExportCenter:
@@ -32,13 +28,20 @@ class ExportCenter:
         metric_df = self._metric_summary_dataframe(results)
         failure_df = detail_df[detail_df["失败标签"].astype(str) != "[]"] if not detail_df.empty else detail_df
         qtype_df = self._question_type_distribution(samples)
+
         overview_df = pd.DataFrame(
             [
-                {"项目": context.name, "实验": run.name, "样本数": summary.get("samples", 0)},
-                {"项目": "平均总分", "实验": summary.get("avg_score", 0), "样本数": ""},
-                {"项目": "成功率", "实验": summary.get("success_rate", 0), "样本数": ""},
-                {"项目": "平均延迟(ms)", "实验": summary.get("avg_latency_ms", 0), "样本数": ""},
-                {"项目": "估算成本", "实验": summary.get("estimated_cost", 0), "样本数": ""},
+                {"项目": context.name, "值": run.name, "备注": f"样本数={summary.get('samples', 0)}"},
+                {"项目": "平均综合得分", "值": summary.get("avg_score", 0), "备注": ""},
+                {"项目": "成功率", "值": summary.get("success_rate", 0), "备注": ""},
+                {"项目": "平均延迟(ms)", "值": summary.get("avg_latency_ms", 0), "备注": ""},
+                {"项目": "估算成本", "值": summary.get("estimated_cost", 0), "备注": ""},
+                {"项目": "LLM建议", "值": summary.get("llm_guidance", ""), "备注": ""},
+                {
+                    "项目": "指标叠加诊断",
+                    "值": "；".join(summary.get("metric_combo_findings", [])[:8]),
+                    "备注": "",
+                },
             ]
         )
 
@@ -51,13 +54,15 @@ class ExportCenter:
 
             workbook = writer.book
             workbook.formats[0].set_font_name("Microsoft YaHei")
-            header_format = workbook.add_format({
-                "bold": True, "bg_color": "#D9EAF7", "font_name": "Microsoft YaHei",
-            })
+            header_format = workbook.add_format(
+                {"bold": True, "bg_color": "#D9EAF7", "font_name": "Microsoft YaHei"}
+            )
             for sheet in writer.sheets.values():
                 sheet.set_row(0, None, header_format)
                 sheet.freeze_panes(1, 0)
-                sheet.set_column(0, 20, 22)
+                sheet.set_column(0, 0, 22)
+                sheet.set_column(1, 1, 42)
+                sheet.set_column(2, 2, 60)
         return path
 
     def export_markdown(
@@ -73,10 +78,7 @@ class ExportCenter:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = self.config.export_dir / f"{run.name}_{timestamp}.md"
         detail_df = self._detail_dataframe(samples, responses, results)
-        failures = (
-            detail_df[detail_df["失败标签"].astype(str) != "[]"].head(10)
-            if not detail_df.empty else detail_df
-        )
+        failures = detail_df[detail_df["失败标签"].astype(str) != "[]"].head(10) if not detail_df.empty else detail_df
         metric_df = self._metric_summary_dataframe(results)
         qtype_df = self._question_type_distribution(samples)
 
@@ -88,25 +90,39 @@ class ExportCenter:
             "",
             "## 项目摘要",
             "",
-            f"| 字段 | 内容 |",
-            f"|------|------|",
+            "| 字段 | 内容 |",
+            "|------|------|",
             f"| 项目 ID | {context.project_id} |",
             f"| 项目背景 | {_trunc(context.project_background, 300)} |",
-            f"| 被评测系统 | {_trunc(context.system_description, 200)} |",
-            f"| 评测目标 | {_trunc(context.evaluation_goals, 200)} |",
-            f"| 业务规则 | {_trunc(context.business_rules, 200)} |",
+            f"| 被评测系统 | {_trunc(context.system_description, 220)} |",
+            f"| 评测目标 | {_trunc(context.evaluation_goals, 220)} |",
+            f"| 业务规则 | {_trunc(context.business_rules, 220)} |",
             "",
             "## 实验概况",
             "",
-            f"| 指标 | 值 |",
-            f"|------|----|",
+            "| 指标 | 值 |",
+            "|------|----|",
             f"| 样本数 | {summary.get('samples', 0)} |",
             f"| 成功率 | {summary.get('success_rate', 0)} |",
-            f"| 平均总分 | {summary.get('avg_score', 0)} |",
+            f"| 平均综合得分 | {summary.get('avg_score', 0)} |",
             f"| 平均延迟(ms) | {summary.get('avg_latency_ms', 0)} |",
             f"| 估算成本 | {summary.get('estimated_cost', 0)} |",
             "",
+            "## LLM建议与修改方向",
+            "",
+            summary.get("llm_guidance", "_本次未生成 LLM 建议（可能不是 LLM 评估模式）_"),
+            "",
+            "## 指标叠加诊断",
+            "",
         ]
+
+        combo_findings = summary.get("metric_combo_findings", [])
+        if combo_findings:
+            for item in combo_findings:
+                lines.append(f"- {item}")
+        else:
+            lines.append("_本次未生成指标叠加诊断_")
+        lines.append("")
 
         lines += ["## 总体指标", ""]
         if not metric_df.empty:
@@ -147,10 +163,10 @@ class ExportCenter:
             lines += ["## 实验对比", ""]
             lines.append("| 实验 | 样本数 | 成功率 | 平均总分 | 平均延迟(ms) | 估算成本 |")
             lines.append("|------|--------|--------|----------|-------------|----------|")
-            for r in comparison_rows:
+            for item in comparison_rows:
                 lines.append(
-                    f"| {r.get('name','')} | {r.get('samples','')} | {r.get('success_rate','')} "
-                    f"| {r.get('avg_score','')} | {r.get('avg_latency_ms','')} | {r.get('estimated_cost','')} |"
+                    f"| {item.get('name', '')} | {item.get('samples', '')} | {item.get('success_rate', '')}"
+                    f" | {item.get('avg_score', '')} | {item.get('avg_latency_ms', '')} | {item.get('estimated_cost', '')} |"
                 )
             lines.append("")
 
@@ -197,19 +213,22 @@ class ExportCenter:
         for name in metric_names:
             values = [result.scores[name].normalized_score for result in results if name in result.scores]
             rows.append({"指标": name, "平均分": round(sum(values) / len(values), 4) if values else 0})
-        return pd.DataFrame(rows)
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df = df.sort_values("平均分", ascending=False)
+        return df
 
     @staticmethod
     def _question_type_distribution(samples: list[EvalSample]) -> pd.DataFrame:
         if not samples:
             return pd.DataFrame(columns=["题型", "数量"])
         return (
-            pd.DataFrame([{"题型": s.question_type or "未分类"} for s in samples])
+            pd.DataFrame([{"题型": sample.question_type or "未分类"} for sample in samples])
             .value_counts("题型")
             .reset_index(name="数量")
         )
 
 
 def _trunc(text: str, limit: int) -> str:
-    text = text.replace("|", "｜").replace("\n", " ")
+    text = text.replace("|", "¦").replace("\n", " ")
     return text[:limit] + "…" if len(text) > limit else text

@@ -4,11 +4,12 @@ import json
 import logging
 import re
 from statistics import mean
+from typing import Any
 
 from app.core.config import AppConfig
 from app.models import EvalResult, EvalSample, ScoreItem, SystemResponse
 from app.models.schemas import FAILURE_LABELS
-from app.services.executor import BatchExecutor, BatchProgress
+from app.services.executor import BatchExecutor
 from app.services.llm_client import OpenAICompatibleClient
 
 
@@ -22,6 +23,7 @@ ANSWER_METRICS = [
     "completeness",
     "hallucination_risk",
 ]
+
 RETRIEVAL_METRICS = [
     "hit_rate",
     "context_relevance",
@@ -32,28 +34,137 @@ RETRIEVAL_METRICS = [
 
 
 METRIC_USER_INFO: dict[str, tuple[str, str]] = {
-    "correctness":        ("正确性",       "答案内容与标准答案的一致程度"),
-    "relevance":          ("相关性",       "回答是否直接切中问题要点"),
-    "faithfulness":       ("忠实性",       "答案是否有检索内容支撑，有没有捏造内容"),
-    "completeness":       ("完整性",       "标准答案的关键信息是否都被覆盖"),
-    "hallucination_risk": ("幻觉风险 ↓",   "答案中无依据内容的比例（越低越好）"),
-    "hit_rate":           ("检索命中率",   "检索结果是否包含了回答所需的核心信息"),
-    "context_relevance":  ("上下文相关性", "召回文档与问题的匹配程度"),
-    "context_precision":  ("上下文精确率", "召回文档中真正有用的比例"),
-    "context_recall":     ("上下文召回率", "标准答案的支撑内容有多少被成功检索到"),
-    "evidence_coverage":  ("证据覆盖率",   "期望证据在检索结果中的覆盖程度"),
+    "correctness": ("正确性", "回答与参考答案是否一致"),
+    "relevance": ("相关性", "回答是否直接回答了问题"),
+    "faithfulness": ("忠实性", "回答是否被检索上下文支持"),
+    "completeness": ("完整性", "关键要点是否覆盖完整"),
+    "hallucination_risk": ("幻觉风险", "无依据内容风险，越低越好"),
+    "hit_rate": ("检索命中率", "检索结果是否命中关键证据"),
+    "context_relevance": ("上下文相关性", "检索上下文与问题是否相关"),
+    "context_precision": ("上下文精确率", "检索内容里有用内容比例"),
+    "context_recall": ("上下文召回率", "该找回的证据找回了多少"),
+    "evidence_coverage": ("证据覆盖率", "回答主张是否有证据覆盖"),
 }
+
+
+METRIC_DETAILED_INFO: dict[str, dict[str, Any]] = {
+    "correctness": {
+        "label": "正确性",
+        "high_is_good": True,
+        "meaning": "最终答案与参考答案/事实标准的一致程度。",
+        "low_risk": "容易出现结论错误、数值错误、实体错误。",
+        "improve": "优先检查知识源准确性、字段映射、答案后处理规则。",
+    },
+    "relevance": {
+        "label": "相关性",
+        "high_is_good": True,
+        "meaning": "回答是否围绕用户问题，不偏题、不答非所问。",
+        "low_risk": "回答冗长但不切题，用户感知质量下降。",
+        "improve": "优化检索 query、回答模板和问题重写策略。",
+    },
+    "faithfulness": {
+        "label": "忠实性",
+        "high_is_good": True,
+        "meaning": "回答中的主张是否可以被检索上下文或引用支持。",
+        "low_risk": "可能在“看起来合理”但证据不足的情况下编造结论。",
+        "improve": "增加证据约束、答案生成时强制引用支持片段。",
+    },
+    "completeness": {
+        "label": "完整性",
+        "high_is_good": True,
+        "meaning": "回答是否覆盖问题所需的关键要点。",
+        "low_risk": "只回答部分信息，遗漏条件、范围或限制。",
+        "improve": "加补全检查（must-have slots）和多步骤回答模板。",
+    },
+    "hallucination_risk": {
+        "label": "幻觉风险",
+        "high_is_good": False,
+        "meaning": "回答中无证据支撑或臆测内容的风险，越低越好。",
+        "low_risk": "高值表示风险高，容易触发不可信回答。",
+        "improve": "引入拒答策略、证据门控、低置信度回退。",
+    },
+    "hit_rate": {
+        "label": "检索命中率",
+        "high_is_good": True,
+        "meaning": "是否检索到预期证据或关键上下文。",
+        "low_risk": "没命中核心证据，后续生成再强也难答对。",
+        "improve": "调整召回策略、索引粒度、query 构造和过滤规则。",
+    },
+    "context_relevance": {
+        "label": "上下文相关性",
+        "high_is_good": True,
+        "meaning": "召回内容与问题本身的相关程度。",
+        "low_risk": "检索结果噪声高，模型容易被干扰。",
+        "improve": "加强重排（rerank）与语义过滤。",
+    },
+    "context_precision": {
+        "label": "上下文精确率",
+        "high_is_good": True,
+        "meaning": "召回内容中有价值信息占比。",
+        "low_risk": "冗余内容多，增加回答偏航概率和成本。",
+        "improve": "缩短 chunk、优化 top-k、加强去噪。",
+    },
+    "context_recall": {
+        "label": "上下文召回率",
+        "high_is_good": True,
+        "meaning": "应召回的关键证据是否被覆盖。",
+        "low_risk": "关键证据缺失，导致“答不全/答错”。",
+        "improve": "扩大召回范围、增加多路检索、补充索引覆盖。",
+    },
+    "evidence_coverage": {
+        "label": "证据覆盖率",
+        "high_is_good": True,
+        "meaning": "答案关键主张是否都能在证据中找到对应支撑。",
+        "low_risk": "主张与证据脱节，可信度不足。",
+        "improve": "答案生成时逐条主张对齐证据并校验。",
+    },
+}
+
+
+METRIC_COMBINATION_GUIDE: list[dict[str, str]] = [
+    {
+        "pattern": "正确性低 + 忠实性低",
+        "meaning": "答案既不正确也缺证据，通常是检索与生成都存在问题。",
+        "direction": "先修检索命中与上下文质量，再收紧生成约束。",
+    },
+    {
+        "pattern": "正确性低 + 忠实性高",
+        "meaning": "回答有引用但结论错，常见于证据理解错误或推理链错误。",
+        "direction": "优化推理提示词、数值计算链、结构化后处理校验。",
+    },
+    {
+        "pattern": "相关性高 + 完整性低",
+        "meaning": "答到了点上，但覆盖不全。",
+        "direction": "增加答案骨架模板和必答要点检查。",
+    },
+    {
+        "pattern": "检索命中低 + 召回低",
+        "meaning": "关键证据根本没被拉回来。",
+        "direction": "优先优化检索召回（query、索引、top-k、多路召回）。",
+    },
+    {
+        "pattern": "检索相关性高 + 精确率低",
+        "meaning": "方向对了，但噪声太多。",
+        "direction": "加强重排、减少噪声 chunk、调小返回窗口。",
+    },
+    {
+        "pattern": "幻觉风险高 + 证据覆盖低",
+        "meaning": "回答与证据脱节，存在明显编造风险。",
+        "direction": "加入证据门控与拒答策略，强制主张-证据对齐。",
+    },
+]
+
 
 SCORING_DEFINITIONS = {
     "correctness": "答案与参考答案/预期范围的一致性，0-1 越高越正确。",
     "relevance": "答案是否直接回应问题，0-1 越高越相关。",
     "faithfulness": "答案是否能被检索上下文或引用支持，0-1 越高越可信。",
-    "completeness": "答案覆盖参考答案关键点的充分程度，0-1 越高越完整。",
-    "hallucination_risk": "幻觉风险，0-1 越高风险越大，汇总时会反向计分。",
-    "hit_rate": "检索上下文/引用是否命中预期证据，命中为 1，否则 0。",
-    "context_relevance": "检索上下文与问题/参考答案的相关性。",
+    "completeness": "答案覆盖关键要点的充分程度，0-1 越高越完整。",
+    "hallucination_risk": "幻觉风险，0-1 越高风险越大（汇总时反向计分）。",
+    "hit_rate": "检索上下文/引用是否命中预期证据，命中越高分越高。",
+    "context_relevance": "检索上下文与问题/参考答案的相关程度。",
     "context_precision": "返回上下文中有用片段的比例估计。",
-    "context_recall": "预期证据被返回上下文覆盖的比例估计。",
+    "context_recall": "预期证据被检索覆盖的比例估计。",
     "evidence_coverage": "答案关键主张是否有证据覆盖。",
 }
 
@@ -71,8 +182,7 @@ class EvaluationEngine:
     ):
         self.config = config
         self.use_llm_judge = use_llm_judge
-        # eval_mode takes precedence; use_llm_judge kept for backward compat
-        if eval_mode in ("embedding", "ragas"):
+        if eval_mode in ("embedding", "ragas", "llm_judge"):
             self._mode = eval_mode
         elif use_llm_judge:
             self._mode = "llm_judge"
@@ -86,10 +196,9 @@ class EvaluationEngine:
             api_base=ragas_api_base or config.llm_api_base,
             api_key=ragas_api_key or config.llm_api_key,
         )
-        # 嵌入模式强制单线程：避免多线程同时加载 PyTorch DLL 触发 Windows SAC 拦截
-        _workers = 1 if self._mode == "embedding" else config.max_workers
+        workers = 1 if self._mode == "embedding" else config.max_workers
         self.executor = BatchExecutor[tuple[EvalSample | None, SystemResponse], EvalResult](
-            max_workers=_workers,
+            max_workers=workers,
             retry_times=config.retry_times,
         )
 
@@ -106,6 +215,7 @@ class EvaluationEngine:
         if self._mode == "embedding":
             if self._sub_evaluator is None:
                 from app.services.embedding_evaluator import EmbeddingEvaluator
+
                 self._sub_evaluator = EmbeddingEvaluator(
                     self.config,
                     self._embedding_model_name or "paraphrase-multilingual-MiniLM-L12-v2",
@@ -115,6 +225,7 @@ class EvaluationEngine:
         if self._mode == "ragas":
             if self._sub_evaluator is None:
                 from app.services.ragas_evaluator import RagasEvaluator
+
                 self._sub_evaluator = RagasEvaluator(self.config, self.llm)
             return self._sub_evaluator.evaluate_one(item)
 
@@ -123,13 +234,13 @@ class EvaluationEngine:
             try:
                 return self._evaluate_with_llm(sample, response)
             except Exception as exc:  # noqa: BLE001
-                logger.exception("LLM 评分失败，降级为规则评分 question_id=%s error=%s", response.question_id, exc)
+                logger.exception("LLM 评分失败，降级规则评分 question_id=%s error=%s", response.question_id, exc)
         return self._evaluate_with_rules(sample, response)
 
     def _evaluate_with_llm(self, sample: EvalSample | None, response: SystemResponse) -> EvalResult:
         system_prompt = "你是严格的中文 RAG 评测裁判。只输出 JSON，不要输出解释。"
         user_prompt = f"""
-请对系统回答进行评分。所有分数范围为 0 到 1。
+请对系统回答进行评分，所有分数范围为 0 到 1。
 评分定义：
 {json.dumps(SCORING_DEFINITIONS, ensure_ascii=False, indent=2)}
 
@@ -140,12 +251,13 @@ class EvaluationEngine:
 检索上下文：{response.retrieved_contexts}
 引用：{response.citations}
 
-输出 JSON 格式：
+输出 JSON：
 {{
-  "scores": {{"correctness": 0.0, "relevance": 0.0, "faithfulness": 0.0,
-              "completeness": 0.0, "hallucination_risk": 0.0,
-              "hit_rate": 0.0, "context_relevance": 0.0, "context_precision": 0.0,
-              "context_recall": 0.0, "evidence_coverage": 0.0}},
+  "scores": {{
+    "correctness": 0.0, "relevance": 0.0, "faithfulness": 0.0, "completeness": 0.0,
+    "hallucination_risk": 0.0, "hit_rate": 0.0, "context_relevance": 0.0,
+    "context_precision": 0.0, "context_recall": 0.0, "evidence_coverage": 0.0
+  }},
   "judge_reason": "中文理由",
   "failure_labels": ["wrong_answer"]
 }}
@@ -175,16 +287,16 @@ class EvaluationEngine:
         success_score = 1.0 if response.success and answer.strip() else 0.0
 
         scores = {
-            "correctness": self._score(overlap_ref * success_score, "与参考答案的字符/词片段重合度估计。"),
-            "relevance": self._score(max(overlap_question, overlap_ref) * success_score, "回答与问题及参考答案的相关性估计。"),
-            "faithfulness": self._score(overlap_context if contexts_text else overlap_ref * 0.8, "有上下文时检查答案是否被上下文支持。"),
-            "completeness": self._score(min(1.0, overlap_ref * 1.15) * success_score, "参考答案关键内容覆盖估计。"),
-            "hallucination_risk": self._score(1 - (overlap_context if contexts_text else overlap_ref), "支持证据越少，幻觉风险越高。"),
-            "hit_rate": self._score(1.0 if evidence_overlap >= 0.12 or answer_has_evidence else 0.0, "预期证据或答案内容是否被检索上下文命中。"),
-            "context_relevance": self._score(max(self._overlap(response.question, contexts_text), evidence_overlap) if contexts_text else 0.0, "上下文与问题/预期证据的相关性。"),
-            "context_precision": self._score(self._context_precision(response.retrieved_contexts, response.question, reference), "有用上下文比例估计。"),
-            "context_recall": self._score(evidence_overlap if expected_evidence else overlap_context, "预期证据覆盖估计。"),
-            "evidence_coverage": self._score(max(evidence_overlap, overlap_context if contexts_text else 0.0), "答案证据覆盖估计。"),
+            "correctness": self._score(overlap_ref * success_score, "与参考答案重合度估计。"),
+            "relevance": self._score(max(overlap_question, overlap_ref) * success_score, "回答与问题相关性估计。"),
+            "faithfulness": self._score(overlap_context if contexts_text else overlap_ref * 0.8, "是否被上下文支持。"),
+            "completeness": self._score(min(1.0, overlap_ref * 1.15) * success_score, "关键要点覆盖程度估计。"),
+            "hallucination_risk": self._score(1 - (overlap_context if contexts_text else overlap_ref), "证据不足时风险更高。"),
+            "hit_rate": self._score(1.0 if evidence_overlap >= 0.12 or answer_has_evidence else 0.0, "证据命中估计。"),
+            "context_relevance": self._score(max(self._overlap(response.question, contexts_text), evidence_overlap) if contexts_text else 0.0, "上下文相关性。"),
+            "context_precision": self._score(self._context_precision(response.retrieved_contexts, response.question, reference), "上下文精确率估计。"),
+            "context_recall": self._score(evidence_overlap if expected_evidence else overlap_context, "上下文召回率估计。"),
+            "evidence_coverage": self._score(max(evidence_overlap, overlap_context if contexts_text else 0.0), "证据覆盖估计。"),
         }
         labels = self._infer_failure_labels(response, scores)
         reason = "规则评分：基于参考答案、问题、系统答案、检索上下文和预期证据的重合度估计。"
@@ -199,8 +311,8 @@ class EvaluationEngine:
     ) -> EvalResult:
         aggregate_inputs = []
         for name, item in scores.items():
-            value = 1 - item.normalized_score if name == "hallucination_risk" else item.normalized_score
-            aggregate_inputs.append(value)
+            score_value = 1 - item.normalized_score if name == "hallucination_risk" else item.normalized_score
+            aggregate_inputs.append(score_value)
         normalized = mean(aggregate_inputs) if aggregate_inputs else 0.0
         valid_labels = [x for x in failure_labels if x in FAILURE_LABELS]
         return EvalResult(
@@ -209,7 +321,7 @@ class EvaluationEngine:
             scores=scores,
             normalized_score=round(normalized, 4),
             judge_reason=reason,
-            judge_model=self.config.judge_model if self.use_llm_judge and self.llm.is_configured else "rule-based-mvp",
+            judge_model=self.config.judge_model if self._mode == "llm_judge" and self.llm.is_configured else "rule-based-mvp",
             score_version=self.config.score_version,
             failure_labels=valid_labels,
         )
@@ -266,4 +378,3 @@ class EvaluationEngine:
             if cls._overlap(context, target) >= 0.08:
                 useful += 1
         return useful / len(contexts)
-

@@ -16,9 +16,16 @@ from app.models import EvalSample, ExperimentRun, ProjectContext, SystemResponse
 from app.models.schemas import FAILURE_LABELS
 from app.services.comparison import comparison_dataframe, summarize_run
 from app.services.connectors import ConnectorConfig, ExternalAPIConnector
-from app.services.evaluator import EvaluationEngine, METRIC_USER_INFO, SCORING_DEFINITIONS
+from app.services.evaluator import (
+    EvaluationEngine,
+    METRIC_COMBINATION_GUIDE,
+    METRIC_DETAILED_INFO,
+    METRIC_USER_INFO,
+    SCORING_DEFINITIONS,
+)
 from app.services.exporter import ExportCenter
 from app.services.importer import dataframe_to_responses, dataframe_to_samples, read_uploaded_table
+from app.services.llm_client import OpenAICompatibleClient
 from app.services.seed import ensure_seed_data
 from app.services.source_loader import SourceFileTooLargeError, parse_source_file
 from app.services.testset_generator import TestsetGenerator, TestsetLLMSettings
@@ -314,6 +321,74 @@ def offer_dataframe_download(df: pd.DataFrame, file_prefix: str) -> None:
         file_name=f"{file_prefix}.csv",
         mime="text/csv",
     )
+
+
+def metric_combo_findings(metric_summary: dict[str, float]) -> list[str]:
+    findings: list[str] = []
+    correctness = float(metric_summary.get("correctness", 0))
+    faithfulness = float(metric_summary.get("faithfulness", 0))
+    relevance = float(metric_summary.get("relevance", 0))
+    completeness = float(metric_summary.get("completeness", 0))
+    hallucination = float(metric_summary.get("hallucination_risk", 0))
+    hit_rate = float(metric_summary.get("hit_rate", 0))
+    ctx_precision = float(metric_summary.get("context_precision", 0))
+    ctx_recall = float(metric_summary.get("context_recall", 0))
+    evidence = float(metric_summary.get("evidence_coverage", 0))
+
+    if correctness < 0.45 and faithfulness < 0.45:
+        findings.append("正确性低 + 忠实性低：检索与生成链路同时偏弱，建议先修检索命中与证据约束。")
+    if correctness < 0.45 and faithfulness >= 0.6:
+        findings.append("正确性低 + 忠实性较高：证据方向可能对，但推理/抽取环节出错。")
+    if relevance >= 0.6 and completeness < 0.45:
+        findings.append("相关性高 + 完整性低：回答切题但不完整，建议增加必答要点检查。")
+    if hit_rate < 0.4 and ctx_recall < 0.4:
+        findings.append("检索命中低 + 召回低：关键证据未被拉回，优先优化召回策略。")
+    if hit_rate >= 0.6 and ctx_precision < 0.45:
+        findings.append("检索命中尚可 + 精确率低：噪声偏高，建议加强重排与去噪。")
+    if hallucination > 0.55 and evidence < 0.45:
+        findings.append("幻觉风险高 + 证据覆盖低：回答与证据脱节，建议增加拒答和证据门控。")
+    if not findings:
+        findings.append("未出现明显的高风险指标叠加，建议继续按低分样本做针对性优化。")
+    return findings
+
+
+def generate_llm_guidance(
+    summary: dict,
+    combo_findings: list[str],
+    api_base: str,
+    api_key: str,
+    model_name: str,
+) -> str:
+    """在 LLM 评估模式下，基于本次评估结果生成可执行建议。"""
+    fallback = (
+        "系统建议（规则回退）：优先处理失败最多的标签，并围绕低分指标分阶段优化。"
+        + " 指标叠加提示：" + "；".join(combo_findings[:3])
+    )
+    if not (api_base and api_key and model_name):
+        return fallback
+    try:
+        llm = OpenAICompatibleClient(config, api_base=api_base, api_key=api_key, model=model_name)
+        text = llm.chat(
+            system_prompt="你是严谨的评测分析师，输出简明、可执行、可落地的建议。",
+            user_prompt=f"""
+请根据以下评估结果输出中文建议：
+1. 先给出总体判断（1-2句）
+2. 再给出3-5条修改方向
+3. 必须指出指标或指标叠加意味着什么问题
+4. 控制在260字以内
+
+评估摘要：
+{json.dumps(summary, ensure_ascii=False)}
+
+指标叠加线索：
+{json.dumps(combo_findings, ensure_ascii=False)}
+""",
+            temperature=0.2,
+            timeout=90,
+        )
+        return (text or "").strip()[:1200] or fallback
+    except Exception:
+        return fallback
 
 
 def attach_responses_to_samples(
@@ -742,10 +817,21 @@ def apply_app_theme() -> None:
             border-radius: 10px;
             padding: 16px 18px;
             margin: 10px 0;
+            transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
         }
         .rag-option-card.active {
             background: #f0faf8;
             border-color: var(--rag-primary-dark);
+        }
+        .rag-option-card-link {
+            color: inherit !important;
+            display: block;
+            text-decoration: none !important;
+        }
+        .rag-option-card-link:hover .rag-option-card {
+            background: #f7fffd;
+            border-color: var(--rag-primary);
+            box-shadow: 0 12px 28px rgba(20, 184, 166, 0.12);
         }
         .rag-option-title {
             color: var(--rag-text);
@@ -757,6 +843,36 @@ def apply_app_theme() -> None:
             color: var(--rag-sub);
             font-size: 13px;
             line-height: 1.55;
+        }
+        .rag-summary-card {
+            background: linear-gradient(135deg, #ecfdf8 0%, #f8fafc 100%);
+            border: 1px solid #b7e8dc;
+            border-radius: 12px;
+            box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06);
+            margin: 18px 0 22px;
+            padding: 20px 22px;
+        }
+        .rag-summary-title {
+            align-items: center;
+            color: var(--rag-text);
+            display: flex;
+            font-size: 18px;
+            font-weight: 850;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .rag-summary-title::before {
+            background: var(--rag-primary);
+            border-radius: 999px;
+            content: "";
+            display: inline-block;
+            height: 10px;
+            width: 10px;
+        }
+        .rag-summary-body {
+            color: #475569;
+            font-size: 14px;
+            line-height: 1.8;
         }
         .rag-export-grid {
             display: grid;
@@ -941,12 +1057,23 @@ def render_eval_mode_cards(eval_mode: str) -> None:
     ]
     html = "".join(
         (
+            f'<a class="rag-option-card-link" href="?eval_mode={key}">'
             f'<div class="rag-option-card {"active" if key == eval_mode else ""}">'
             f'<div class="rag-option-title">{"● " if key == eval_mode else "○ "}{ui_escape(title)}</div>'
             f'<div class="rag-option-desc">{ui_escape(desc)}</div>'
-            "</div>"
+            "</div></a>"
         )
         for key, title, desc in items
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def render_summary_card(summary_text: str) -> None:
+    html = (
+        '<div class="rag-summary-card">'
+        '<div class="rag-summary-title">综合评论</div>'
+        f'<div class="rag-summary-body">{ui_escape(summary_text)}</div>'
+        "</div>"
     )
     st.markdown(html, unsafe_allow_html=True)
 
@@ -1790,21 +1917,33 @@ with tab_eval:
                     st.rerun()
 
         with st.expander("各指标说明"):
-            _info_rows = [{"指标": label, "说明": desc} for _, (label, desc) in METRIC_USER_INFO.items()]
-            _show_df(pd.DataFrame(_info_rows))
+            detail_rows = []
+            for metric_name, detail in METRIC_DETAILED_INFO.items():
+                detail_rows.append(
+                    {
+                        "指标": detail["label"],
+                        "方向": "越高越好" if detail["high_is_good"] else "越低越好",
+                        "含义": detail["meaning"],
+                        "低分/异常风险": detail["low_risk"],
+                        "建议优化方向": detail["improve"],
+                    }
+                )
+            st.caption("单指标说明：用于解释每个分数意味着什么，以及低分时优先该改哪里。")
+            _show_df(pd.DataFrame(detail_rows))
+            st.caption("指标叠加说明：当多个指标同时异常时，通常指向更具体的问题根因。")
+            _show_df(pd.DataFrame(METRIC_COMBINATION_GUIDE))
 
         st.subheader("评估方式")
-        eval_mode = st.radio(
-            "选择评估引擎",
-            options=["rule", "embedding", "ragas"],
-            format_func=lambda x: {
-                "rule": "⚡ 规则评分（快速，字符重叠，仅供初筛）",
-                "embedding": "🧠 语义嵌入（本地运行，无需 API，推荐）",
-                "ragas": "🎯 RAGAS 算法（最准确，每条样本约 8 次 LLM 调用）",
-            }[x],
-            key="eval_mode_radio",
-            index=1,
-        )
+        query_eval_mode = None
+        try:
+            query_eval_mode = st.query_params.get("eval_mode")
+        except Exception:
+            query_eval_mode = None
+        if isinstance(query_eval_mode, list):
+            query_eval_mode = query_eval_mode[0] if query_eval_mode else None
+        if query_eval_mode in {"rule", "embedding", "ragas"}:
+            st.session_state["eval_mode_choice"] = query_eval_mode
+        eval_mode = st.session_state.get("eval_mode_choice", "embedding")
         render_eval_mode_cards(eval_mode)
 
         eval_embedding_model = None
@@ -1903,8 +2042,24 @@ with tab_eval:
                 store.delete_eval_results(run.run_id)  # 先清旧结果，避免新旧混存
                 store.save_eval_results(run.run_id, results)
                 summary = summarize_run(run, limited, results)
+                combo_findings = metric_combo_findings(summary.get("metric_summary", {}))
+                summary["metric_combo_findings"] = combo_findings
+                if eval_mode == "ragas":
+                    _base = _ragas_base or config.llm_api_base
+                    _key = _ragas_key or config.llm_api_key
+                    _model = _ragas_model or config.llm_model
+                    summary["llm_guidance"] = generate_llm_guidance(
+                        summary,
+                        combo_findings,
+                        _base,
+                        _key,
+                        _model,
+                    )
+                else:
+                    summary["llm_guidance"] = ""
                 run.aggregate = summary
                 run.config["score_version"] = config.score_version
+                run.config["eval_mode"] = eval_mode
                 store.save_experiment(run)
                 st.success(f"评估完成，保存 {len(results)} 条评分结果。")
                 st.rerun()
@@ -1912,8 +2067,20 @@ with tab_eval:
         results = store.list_eval_results(run.run_id)
         if results:
             summary = summarize_run(run, responses, results)
-            st.subheader("综合结论")
-            st.info(overall_judge_summary(summary, results))
+            if isinstance(run.aggregate, dict):
+                if run.aggregate.get("metric_combo_findings"):
+                    summary["metric_combo_findings"] = run.aggregate.get("metric_combo_findings")
+                if run.aggregate.get("llm_guidance"):
+                    summary["llm_guidance"] = run.aggregate.get("llm_guidance")
+            render_summary_card(overall_judge_summary(summary, results))
+            combo_findings = summary.get("metric_combo_findings") or metric_combo_findings(summary.get("metric_summary", {}))
+            if combo_findings:
+                st.caption("指标叠加诊断")
+                for item in combo_findings:
+                    st.write(f"- {item}")
+            if run.config.get("eval_mode") == "ragas":
+                st.subheader("LLM修改建议")
+                st.info(summary.get("llm_guidance") or "本次未生成 LLM 建议。")
 
             metric_summary = summary.get("metric_summary", {})
             high_risk_count = sum(1 for result in results if result.normalized_score < 0.4)
@@ -1934,6 +2101,7 @@ with tab_eval:
                     status = "🟢 良好" if value >= 0.65 else "🟡 一般" if value >= 0.4 else "🔴 偏低"
                 metric_rows.append({"指标": label, "分数": round(value, 3), "说明": desc, "状态": status})
             if metric_rows:
+                metric_rows = sorted(metric_rows, key=lambda row: row["分数"], reverse=True)
                 metric_df = pd.DataFrame(metric_rows)
                 st.subheader("指标概览")
                 _show_df(
@@ -1942,10 +2110,6 @@ with tab_eval:
                         "分数": st.column_config.ProgressColumn("分数", min_value=0, max_value=1, format="%.3f"),
                     },
                 )
-                chart_df = pd.DataFrame(
-                    [{"指标": r["指标"], "分数": r["分数"]} for r in metric_rows]
-                )
-                _show_horizontal_bar_chart(chart_df, category="指标", value="分数")
 
             # ── 深度分析 ──────────────────────────────────────────────────
             st.subheader("深度分析")
@@ -2173,6 +2337,11 @@ with tab_export:
         results = store.list_eval_results(run.run_id)
         samples = store.list_test_cases(run.project_id)
         summary = summarize_run(run, responses, results)
+        if isinstance(run.aggregate, dict):
+            if run.aggregate.get("metric_combo_findings"):
+                summary["metric_combo_findings"] = run.aggregate.get("metric_combo_findings")
+            if run.aggregate.get("llm_guidance"):
+                summary["llm_guidance"] = run.aggregate.get("llm_guidance")
         exporter = ExportCenter(config)
 
         comparison_rows = []
