@@ -13,7 +13,10 @@
       "Bash(jq *)",
       "Bash(bash \"C:/Users/jonas/.claude/statusline-command.sh\")",
       "Bash(xargs grep *)",
-      "Bash(gh api *)"
+      "Bash(gh api *)",
+      "Bash(python -c \"from app.services.evaluator import METRIC_MODE_EXPLANATIONS; print\\(len\\(METRIC_MODE_EXPLANATIONS\\), list\\(METRIC_MODE_EXPLANATIONS\\)\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app/main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('main.py OK'\\)\")",
+      "Bash(python *)"
     ]
   }
 }

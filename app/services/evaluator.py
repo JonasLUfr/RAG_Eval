@@ -121,6 +121,58 @@ METRIC_DETAILED_INFO: dict[str, dict[str, Any]] = {
 }
 
 
+METRIC_MODE_EXPLANATIONS: dict[str, dict[str, str]] = {
+    "rule": {
+        "correctness": "Jaccard(答案, 参考答案)，token = 单字符 ∪ 相邻 bigram。",
+        "relevance": "max(Jaccard(答案,问题), Jaccard(答案,参考答案))。",
+        "faithfulness": "Jaccard(答案, 检索上下文+引用拼接)。",
+        "completeness": "Jaccard(答案, 参考答案) × 1.15（略放宽）。",
+        "hallucination_risk": "1 − Jaccard(答案, 上下文)，越大风险越高。",
+        "hit_rate": "Jaccard(预期证据, 上下文) ≥ 0.12 → 1.0，否则 0。",
+        "context_relevance": "Jaccard(问题, 上下文)。",
+        "context_precision": "上下文中与「问题+参考答案」Jaccard ≥ 0.08 的片段比例。",
+        "context_recall": "Jaccard(预期证据, 上下文)；缺证据时退回到答案-上下文 overlap。",
+        "evidence_coverage": "max(证据 overlap, 答案-上下文 overlap)。",
+    },
+    "llm_judge": {
+        "correctness": "单次 LLM 调用，10 个分数一并返回（同一 prompt）。",
+        "relevance": "同上，由裁判 LLM 在同一 JSON 中给出。",
+        "faithfulness": "同上。",
+        "completeness": "同上。",
+        "hallucination_risk": "同上（裁判直接给风险分，越低越好）。",
+        "hit_rate": "同上。",
+        "context_relevance": "同上。",
+        "context_precision": "同上。",
+        "context_recall": "同上。",
+        "evidence_coverage": "同上。",
+    },
+    "ragas": {
+        "correctness": "独立 LLM 调用：判定答案与参考答案语义一致性。",
+        "relevance": "独立 LLM 调用：答案是否对问题作答。",
+        "faithfulness": "独立 LLM 调用：答案主张是否被上下文支持。",
+        "completeness": "独立 LLM 调用：是否覆盖参考答案的关键要点。",
+        "hallucination_risk": "独立 LLM 调用：识别无证据/编造的部分。",
+        "hit_rate": "独立 LLM 调用：检索是否命中预期证据。",
+        "context_relevance": "独立 LLM 调用：上下文与问题的相关性。",
+        "context_precision": "复用 context_relevance 输出（不另发请求）。",
+        "context_recall": "独立 LLM 调用：参考答案要点在上下文中的覆盖。",
+        "evidence_coverage": "复用 context_recall 输出（不另发请求）。",
+    },
+    "embedding": {
+        "correctness": "cosine(embed(答案), embed(参考答案))。",
+        "relevance": "max(cosine(答案,问题), cosine(答案,参考)×0.7)。",
+        "faithfulness": "cosine(答案, 上下文拼接)。",
+        "completeness": "复用 correctness 的 cosine（语义覆盖近似）。",
+        "hallucination_risk": "1 − cosine(答案, 上下文)。",
+        "hit_rate": "上下文-问题 cosine 均值或证据 cosine > 0.4 → 1.0。",
+        "context_relevance": "每段上下文与问题 cosine 的均值。",
+        "context_precision": "上下文-问题 cosine > 0.4 的片段比例。",
+        "context_recall": "max(cosine(参考, 每段上下文))。",
+        "evidence_coverage": "max(cosine(预期证据, 每段上下文))；缺证据时退回 recall。",
+    },
+}
+
+
 METRIC_COMBINATION_GUIDE: list[dict[str, str]] = [
     {
         "pattern": "正确性低 + 忠实性低",

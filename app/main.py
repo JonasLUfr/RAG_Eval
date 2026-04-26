@@ -20,6 +20,7 @@ from app.services.evaluator import (
     EvaluationEngine,
     METRIC_COMBINATION_GUIDE,
     METRIC_DETAILED_INFO,
+    METRIC_MODE_EXPLANATIONS,
     METRIC_USER_INFO,
 )
 from app.services.exporter import ExportCenter
@@ -2043,7 +2044,7 @@ with tab_eval:
                     st.success("实验已删除（含响应和评分）。")
                     st.rerun()
 
-        with st.expander("各指标说明"):
+        with st.expander("各指标说明(通用)"):
             detail_rows = []
             for metric_name, detail in METRIC_DETAILED_INFO.items():
                 detail_rows.append(
@@ -2062,6 +2063,14 @@ with tab_eval:
 
         st.subheader("评估方式")
         eval_mode = render_eval_mode_cards(st.session_state.get("eval_mode_choice", "embedding"))
+
+        _mode_label = {"rule": "规则", "llm_judge": "LLM 裁判", "ragas": "RAGAS", "embedding": "嵌入相似度"}.get(eval_mode, eval_mode)
+        with st.expander(f"当前模式（{_mode_label}）下各指标如何计算", expanded=False):
+            _mode_rows = [
+                {"指标": METRIC_DETAILED_INFO[name]["label"], "该模式下如何计算": how}
+                for name, how in METRIC_MODE_EXPLANATIONS.get(eval_mode, {}).items()
+            ]
+            _show_df(pd.DataFrame(_mode_rows))
 
         eval_embedding_model = None
         _ragas_base = _ragas_key = _ragas_model = ""
