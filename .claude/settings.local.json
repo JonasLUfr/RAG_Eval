@@ -9,7 +9,11 @@
       "PowerShell(Get-ChildItem \"C:\\\\Windows\\\\Fonts\" | Where-Object { $_.Name -match \"sim|msyh|yahei\" -and $_.Extension -eq \".ttf\" } | Select-Object Name, FullName | Format-Table)",
       "Bash(python -m py_compile app/main.py)",
       "Bash(python -c \"import xhtml2pdf; print\\(xhtml2pdf.__version__\\)\")",
-      "Bash(python -c \"from xhtml2pdf import context; import inspect; src = inspect.getsource\\(context.pisaContext.loadFont\\)\")"
+      "Bash(python -c \"from xhtml2pdf import context; import inspect; src = inspect.getsource\\(context.pisaContext.loadFont\\)\")",
+      "Bash(jq *)",
+      "Bash(bash \"C:/Users/jonas/.claude/statusline-command.sh\")",
+      "Bash(xargs grep *)",
+      "Bash(gh api *)"
     ]
   }
 }

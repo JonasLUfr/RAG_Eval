@@ -24,6 +24,9 @@ class AppConfig:
     llm_model: str = "gpt-4o-mini"
     judge_model: str = "gpt-4o-mini"
     score_version: str = "mvp-v1"
+    # RAGAS 上下文截断参数默认值（适配大多数 RAG 系统，用户可在评估页面自定义）
+    eval_max_contexts: int = 5
+    eval_context_max_chars: int = 500
 
 
 def load_config() -> AppConfig:

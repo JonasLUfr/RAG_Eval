@@ -21,7 +21,6 @@ from app.services.evaluator import (
     METRIC_COMBINATION_GUIDE,
     METRIC_DETAILED_INFO,
     METRIC_USER_INFO,
-    SCORING_DEFINITIONS,
 )
 from app.services.exporter import ExportCenter
 from app.services.importer import dataframe_to_responses, dataframe_to_samples, read_uploaded_table
@@ -32,7 +31,11 @@ from app.services.testset_generator import TestsetGenerator, TestsetLLMSettings
 from app.storage import SQLiteStore
 
 
-st.set_page_config(page_title="RAG_Eval 评测工作台", layout="wide")
+st.set_page_config(
+    page_title="RAG_Eval 评测工作台",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 try:
     import pyarrow  # noqa: F401
@@ -109,18 +112,27 @@ def _show_horizontal_bar_chart(
     color: str = "#0f6f68",
     height_per_row: int = 34,
     value_format: str = ".3f",
+    text_label: str | None = None,
 ) -> None:
     """Render readable horizontal bars with labels that do not rotate vertically."""
     if df.empty or category not in df.columns or value not in df.columns:
         _show_df(df)
         return
-    chart_df = df[[category, value]].copy()
+    cols = [category, value]
+    if text_label and text_label in df.columns:
+        cols.append(text_label)
+    chart_df = df[cols].copy()
     chart_df[value] = pd.to_numeric(chart_df[value], errors="coerce").fillna(0)
     chart_df[category] = chart_df[category].astype(str)
+    if text_label and text_label in chart_df.columns:
+        chart_df[text_label] = chart_df[text_label].astype(str)
     height = max(180, min(520, len(chart_df) * height_per_row + 42))
     try:
         import altair as alt
 
+        tooltip = [alt.Tooltip(f"{category}:N"), alt.Tooltip(f"{value}:Q", format=value_format)]
+        if text_label and text_label in chart_df.columns:
+            tooltip.append(alt.Tooltip(f"{text_label}:N", title="标签"))
         bar = (
             alt.Chart(chart_df)
             .mark_bar(cornerRadiusEnd=4, height=18)
@@ -128,7 +140,7 @@ def _show_horizontal_bar_chart(
                 y=alt.Y(f"{category}:N", sort="-x", title="", axis=alt.Axis(labelLimit=260)),
                 x=alt.X(f"{value}:Q", title="", axis=alt.Axis(grid=True)),
                 color=alt.value(color),
-                tooltip=[alt.Tooltip(f"{category}:N"), alt.Tooltip(f"{value}:Q", format=value_format)],
+                tooltip=tooltip,
             )
         )
         label = (
@@ -137,7 +149,7 @@ def _show_horizontal_bar_chart(
             .encode(
                 y=alt.Y(f"{category}:N", sort="-x", title=""),
                 x=alt.X(f"{value}:Q", title=""),
-                text=alt.Text(f"{value}:Q", format=value_format),
+                text=alt.Text(f"{text_label}:N") if text_label and text_label in chart_df.columns else alt.Text(f"{value}:Q", format=value_format),
             )
         )
         _show_altair((bar + label).properties(height=height), use_container_width=True)
@@ -461,13 +473,78 @@ def apply_app_theme() -> None:
         }
         header[data-testid="stHeader"] {
             background: transparent;
-            height: 0;
+            height: 48px;
+            pointer-events: none;
+            z-index: 999998;
         }
-        [data-testid="stToolbar"],
+        header[data-testid="stHeader"] button,
+        header[data-testid="stHeader"] [role="button"] {
+            pointer-events: auto;
+        }
         [data-testid="stDecoration"],
         [data-testid="stStatusWidget"] {
             visibility: hidden;
             height: 0;
+        }
+        #MainMenu,
+        footer {
+            visibility: hidden;
+        }
+        [data-testid="collapsedControl"],
+        [data-testid="stSidebarCollapseButton"] {
+            display: block !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+            pointer-events: auto !important;
+            z-index: 999999 !important;
+        }
+        [data-testid="collapsedControl"] {
+            height: 32px !important;
+            position: fixed !important;
+            top: 16px !important;
+            left: 18px !important;
+            width: 48px !important;
+        }
+        [data-testid="collapsedControl"] button,
+        [data-testid="stSidebarCollapseButton"] button {
+            align-items: center !important;
+            background: transparent !important;
+            border: 0 !important;
+            border-radius: 6px !important;
+            box-shadow: none !important;
+            color: inherit !important;
+            display: inline-flex !important;
+            font-family: Inter, "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif !important;
+            font-size: 0 !important;
+            font-weight: 900 !important;
+            height: 32px !important;
+            justify-content: center !important;
+            letter-spacing: -0.04em !important;
+            min-height: 32px !important;
+            padding: 0 !important;
+            width: 48px !important;
+        }
+        [data-testid="collapsedControl"] button:hover,
+        [data-testid="stSidebarCollapseButton"] button:hover {
+            background: rgba(20, 184, 166, 0.12) !important;
+        }
+        [data-testid="collapsedControl"] svg,
+        [data-testid="stSidebarCollapseButton"] svg {
+            display: none !important;
+        }
+        [data-testid="collapsedControl"] button > *,
+        [data-testid="stSidebarCollapseButton"] button > * {
+            display: none !important;
+        }
+        [data-testid="collapsedControl"] button::before {
+            color: #0f172a;
+            content: ">>";
+            font-size: 18px;
+        }
+        [data-testid="stSidebarCollapseButton"] button::before {
+            color: #ffffff;
+            content: "<<";
+            font-size: 18px;
         }
         [data-testid="stSidebar"] {
             background: var(--rag-sidebar);
@@ -844,6 +921,49 @@ def apply_app_theme() -> None:
             font-size: 13px;
             line-height: 1.55;
         }
+        .st-key-eval_mode_choice div[role="radiogroup"] {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            width: 100%;
+        }
+        .st-key-eval_mode_choice label {
+            background: #ffffff;
+            border: 2px solid var(--rag-border);
+            border-radius: 10px;
+            box-sizing: border-box;
+            min-height: 92px;
+            margin: 0 !important;
+            padding: 16px 18px !important;
+            transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+            width: 100% !important;
+            max-width: none !important;
+        }
+        .st-key-eval_mode_choice,
+        .st-key-eval_mode_choice > div,
+        .st-key-eval_mode_choice [data-testid="stRadio"] {
+            width: 100% !important;
+            max-width: none !important;
+        }
+        .st-key-eval_mode_choice label:hover {
+            background: #f7fffd;
+            border-color: var(--rag-primary);
+            box-shadow: 0 12px 28px rgba(20, 184, 166, 0.10);
+        }
+        .st-key-eval_mode_choice label:has(input:checked) {
+            background: #f0faf8;
+            border-color: var(--rag-primary-dark);
+        }
+        .st-key-eval_mode_choice label p {
+            color: var(--rag-text) !important;
+            font-size: 15px !important;
+            font-weight: 800 !important;
+        }
+        .st-key-eval_mode_choice label small {
+            color: var(--rag-sub) !important;
+            font-size: 13px !important;
+            line-height: 1.55 !important;
+        }
         .rag-summary-card {
             background: linear-gradient(135deg, #ecfdf8 0%, #f8fafc 100%);
             border: 1px solid #b7e8dc;
@@ -1037,35 +1157,42 @@ def render_kpi_cards(cards: list[tuple[str, str, str]]) -> None:
     st.markdown(f'<div class="rag-kpi-grid">{card_html}</div>', unsafe_allow_html=True)
 
 
-def render_eval_mode_cards(eval_mode: str) -> None:
+def render_eval_mode_cards(eval_mode: str) -> str:
     items = [
         (
             "rule",
-            "规则评分",
-            "快速，基于字符重叠和关键词匹配，适合初筛，准确性有限。",
+            "相似度规则评分 (基础)",
+            "快速，基于 Jaccard 字符/bigram 重合度算法，将文本拆成字符集合与二元字符组（bigram）的并集后计算交集比，准确性有限。",
         ),
         (
             "embedding",
-            "语义嵌入相似度（推荐）",
-            "本地运行，无需 API，基于 embedding 模型计算语义相似度，准确性较好。",
+            "语义嵌入相似度（本地）",
+            "本地运行，无需 API，只基于 embedding 模型计算语义相似度，准确性较好。",
+        ),
+        (
+            "llm_judge",
+            "LLM 裁判评分 (标准)",
+            "每条样本约 1 次 LLM 调用，理解语义与证据关系，Token即时间等成本低于 RAGAS。",
         ),
         (
             "ragas",
-            "RAGAS 框架评估",
-            "最准确，覆盖 faithfulness、relevancy 等维度，每条样本约 8 次 LLM 调用。",
+            "RAGAS 框架评估 (精确)",
+            "最准确，参考Ragas算法，覆盖 faithfulness、relevancy 等多维度，每条样本约 8 次 LLM 调用，若测试集庞大，成本会大幅上升。",
         ),
     ]
-    html = "".join(
-        (
-            f'<a class="rag-option-card-link" href="?eval_mode={key}">'
-            f'<div class="rag-option-card {"active" if key == eval_mode else ""}">'
-            f'<div class="rag-option-title">{"● " if key == eval_mode else "○ "}{ui_escape(title)}</div>'
-            f'<div class="rag-option-desc">{ui_escape(desc)}</div>'
-            "</div></a>"
-        )
-        for key, title, desc in items
+    keys = [key for key, _, _ in items]
+    title_map = {key: title for key, title, _ in items}
+    desc_map = {key: desc for key, _, desc in items}
+    if st.session_state.get("eval_mode_choice") not in keys:
+        st.session_state["eval_mode_choice"] = eval_mode if eval_mode in keys else "embedding"
+    return st.radio(
+        "评估方式",
+        options=keys,
+        format_func=lambda key: title_map[key],
+        captions=[desc_map[key] for key in keys],
+        key="eval_mode_choice",
+        label_visibility="collapsed",
     )
-    st.markdown(html, unsafe_allow_html=True)
 
 
 def render_summary_card(summary_text: str) -> None:
@@ -1310,7 +1437,7 @@ render_sidebar_context(project)
 render_sidebar_footer()
 
 tab_dashboard, tab_context, tab_testset, tab_experiment, tab_eval, tab_compare, tab_export = st.tabs(
-    ["总览", "项目设置", "测试问题集", "运行测试", "评估与失败分析", "实验对比", "导出中心"]
+    ["总览", "项目设置", "测试问题集", "运行测试实验", "评估与失败分析", "实验对比", "导出中心"]
 )
 
 
@@ -1333,7 +1460,7 @@ with tab_context:
             "项目背景",
             value=base.project_background,
             height=120,
-            placeholder="例如：这是一个面向企业销售数据的中文问答系统，用户会询问销售额、客户、产品、时间范围等问题。",
+            placeholder="例如：这是一个面向企业销售数据的中文问答AI系统，用户会询问销售额、客户、产品、时间范围等问题。",
         )
         system_description = st.text_area(
             "被评测系统说明",
@@ -1366,7 +1493,7 @@ with tab_context:
         )
         replace_assets = st.checkbox("用本次上传材料替换已有材料", value=False)
 
-        with st.expander("高级补充（可选，不建议一开始填写）"):
+        with st.expander("高级补充（可选，如不熟悉可不填）"):
             schema_text = st.text_area("Schema / 文档结构", value=base.schema_text, height=100)
             metadata_json = st.text_area("元数据 JSON", value=base.metadata_json, height=80)
             sample_rows = st.text_area("样例行", value=base.sample_rows, height=80)
@@ -1509,11 +1636,11 @@ with tab_testset:
                 placeholder="例如：http://127.0.0.1:7890；不填则使用系统环境变量代理",
             )
             st.caption(
-                "如果办公网络需要代理，建议填写本机代理地址；如果经常超时，可以先把生成数量降到 5-10 条，并把超时调到 180-300 秒。"
+                "如果网络需要代理，建议填写本机代理地址；如果经常超时，可以先把生成数量降到 5-10 条，并把超时调到 180-300 秒。"
             )
 
             # 清除按钮
-            if st.button("清除 LLM 配置"):
+            if st.button("清除本次 LLM 配置"):
                 st.session_state.llm_api_base = config.llm_api_base
                 st.session_state.llm_api_key = config.llm_api_key
                 st.session_state.llm_model_name = config.llm_model
@@ -1529,7 +1656,7 @@ with tab_testset:
             st.session_state.llm_timeout_seconds = int(timeout_seconds)
 
             question_type_text = st.text_area(
-                "本次生成题型要求",
+                "本次生成题型要求(推荐填写)",
                 value=project.question_type_instructions,
                 height=90,
             )
@@ -1898,8 +2025,8 @@ with tab_eval:
         col_m1.metric("系统输出数", len(responses))
         col_m2.metric("已评分样本数", len(existing_results))
 
-        with st.expander("🗑️ 删除操作"):
-            st.caption("以下操作不可撤销，请确认后再执行。")
+        with st.expander("删除操作"):
+            st.caption("以下操作不可撤销，请确认后再执行！")
             _dcol1, _dcol2 = st.columns(2)
             with _dcol1:
                 _confirm_clear = st.checkbox("确认清除评分结果", key="confirm_clear_eval")
@@ -1934,20 +2061,12 @@ with tab_eval:
             _show_df(pd.DataFrame(METRIC_COMBINATION_GUIDE))
 
         st.subheader("评估方式")
-        query_eval_mode = None
-        try:
-            query_eval_mode = st.query_params.get("eval_mode")
-        except Exception:
-            query_eval_mode = None
-        if isinstance(query_eval_mode, list):
-            query_eval_mode = query_eval_mode[0] if query_eval_mode else None
-        if query_eval_mode in {"rule", "embedding", "ragas"}:
-            st.session_state["eval_mode_choice"] = query_eval_mode
-        eval_mode = st.session_state.get("eval_mode_choice", "embedding")
-        render_eval_mode_cards(eval_mode)
+        eval_mode = render_eval_mode_cards(st.session_state.get("eval_mode_choice", "embedding"))
 
         eval_embedding_model = None
         _ragas_base = _ragas_key = _ragas_model = ""
+        _eval_max_contexts: int | None = None
+        _eval_context_max_chars: int | None = None
 
         if eval_mode == "embedding":
             from app.services.embedding_evaluator import EMBEDDING_MODELS
@@ -1990,19 +2109,83 @@ with tab_eval:
                         "API Key", type="password", value=config.llm_api_key, key="ragas_api_key_input",
                     )
 
+        elif eval_mode == "llm_judge":
+            st.warning("LLM 裁判每条样本通常调用 1 次 LLM，建议先用小批量确认费用和评分稳定性。")
+            _existing_base = st.session_state.get("llm_api_base", "") or config.llm_api_base
+            _existing_key = st.session_state.get("llm_api_key", "") or config.llm_api_key
+            _existing_model = config.judge_model or config.llm_model
+            _use_existing = st.checkbox(
+                f"使用当前裁判模型配置（{_existing_base or '未配置'}）",
+                value=bool(_existing_base and _existing_key),
+                key="llm_judge_use_existing",
+            )
+            if _use_existing and _existing_base and _existing_key:
+                _ragas_base, _ragas_key, _ragas_model = _existing_base, _existing_key, _existing_model
+                st.caption(f"裁判模型：{_ragas_model}")
+            else:
+                _jcol1, _jcol2 = st.columns(2)
+                with _jcol1:
+                    _ragas_base = st.text_input(
+                        "API Base", value=config.llm_api_base, key="llm_judge_api_base_input",
+                        placeholder="https://api.openai.com/v1",
+                    )
+                    _ragas_model = st.text_input("裁判模型ID", value=config.judge_model, key="llm_judge_model_input")
+                with _jcol2:
+                    _ragas_key = st.text_input(
+                        "API Key", type="password", value=config.llm_api_key, key="llm_judge_api_key_input",
+                    )
+
         elif eval_mode == "rule":
             st.info(
                 "规则评分基于字符/二元组重叠度，速度快但不理解语义，容易高估相似但措辞不同的答案。"
                 "建议仅用于快速初筛，正式评估请选择语义嵌入或 RAGAS。"
             )
 
+        if eval_mode in {"ragas", "llm_judge"}:
+            with st.expander("RAG 系统上下文参数（不填则使用通用默认值）", expanded=False):
+                st.caption(
+                    "以下参数控制评估时传入裁判 LLM 的上下文内容量。"
+                    "默认值（最多 5 段 / 每段 500 字）适配大多数 RAG 系统，"
+                    "**但若你的系统 chunk 较长或 top-k 较大，建议根据实际情况调整，否则评分可能偏低或信息截断。**"
+                )
+                _ctx_col1, _ctx_col2 = st.columns(2)
+                with _ctx_col1:
+                    _max_ctx_input = st.number_input(
+                        "最多取几段上下文（top-k）",
+                        min_value=1, max_value=20,
+                        value=config.eval_max_contexts,
+                        step=1,
+                        key="eval_max_contexts",
+                        help="你的 RAG 系统每次检索返回几段，建议与实际 top-k 保持一致。默认 5。",
+                    )
+                with _ctx_col2:
+                    _max_chars_input = st.number_input(
+                        "每段上下文最多字符数",
+                        min_value=100, max_value=3000,
+                        value=config.eval_context_max_chars,
+                        step=100,
+                        key="eval_context_max_chars",
+                        help="你的 RAG 系统 chunk 大小（字符数）。默认 500，较长 chunk 建议调高至 800-1500。",
+                    )
+                _using_defaults = (
+                    _max_ctx_input == config.eval_max_contexts
+                    and _max_chars_input == config.eval_context_max_chars
+                )
+                if _using_defaults:
+                    st.warning(
+                        "当前使用通用默认参数（5段 / 500字/段）。"
+                        "若你的 RAG 系统 chunk 较大或 top-k 较多，评分精度可能受影响，建议填写实际参数。"
+                    )
+                _eval_max_contexts = int(_max_ctx_input)
+                _eval_context_max_chars = int(_max_chars_input)
+
         _btn_spacer, _btn_col = st.columns([5, 1.4])
         with _btn_col:
             start_eval = st.button("开始 / 重新评估", type="primary", use_container_width=True)
         if start_eval:
             _ok = True
-            if eval_mode == "ragas" and not (_ragas_base and _ragas_key):
-                st.error("请填写 RAGAS 的 API Base 和 API Key。")
+            if eval_mode in {"ragas", "llm_judge"} and not (_ragas_base and _ragas_key):
+                st.error("请填写所选评估方式的 API Base 和 API Key。")
                 _ok = False
             if _ok:
                 limited = responses[: config.default_max_eval_questions]
@@ -2037,6 +2220,8 @@ with tab_eval:
                     ragas_api_base=_ragas_base or None,
                     ragas_api_key=_ragas_key or None,
                     ragas_model=_ragas_model or None,
+                    eval_max_contexts=_eval_max_contexts,
+                    eval_context_max_chars=_eval_context_max_chars,
                 )
                 results = engine.evaluate_batch(limited, samples_by_id, update_progress)
                 store.delete_eval_results(run.run_id)  # 先清旧结果，避免新旧混存
@@ -2219,14 +2404,12 @@ with tab_eval:
                         .rename(columns={"mean": "平均得分", "count": "样本数"})
                         .sort_values("平均得分")
                     )
-                    _show_horizontal_bar_chart(_tdf, category="题型", value="平均得分")
-                    st.caption("红色=偏低，黄色=一般，绿色=良好。得分偏低的题型是系统薄弱点。")
-                    _show_df(
-                        _tdf,
-                        column_config={
-                            "平均得分": st.column_config.ProgressColumn("平均得分", min_value=0, max_value=1, format="%.3f"),
-                        },
+                    _tdf["图表标签"] = _tdf.apply(
+                        lambda row: f"{row['平均得分']:.3f}（样本数：{int(row['样本数'])}）",
+                        axis=1,
                     )
+                    _show_horizontal_bar_chart(_tdf, category="题型", value="平均得分", text_label="图表标签")
+                    st.caption("红色=偏低，黄色=一般，绿色=良好。得分偏低的题型是系统薄弱点。")
                 else:
                     st.info("测试用例需填写题型字段才能展示此图。")
 

@@ -10,7 +10,7 @@ import requests
 
 from app.core.config import AppConfig
 from app.models import EvalSample, SystemResponse
-from app.services.executor import BatchExecutor, BatchProgress
+from app.services.executor import BatchExecutor
 
 
 logger = logging.getLogger(__name__)

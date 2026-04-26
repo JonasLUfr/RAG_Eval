@@ -179,6 +179,8 @@ class EvaluationEngine:
         ragas_api_base: str | None = None,
         ragas_api_key: str | None = None,
         ragas_model: str | None = None,
+        eval_max_contexts: int | None = None,
+        eval_context_max_chars: int | None = None,
     ):
         self.config = config
         self.use_llm_judge = use_llm_judge
@@ -189,6 +191,8 @@ class EvaluationEngine:
         else:
             self._mode = "rule"
         self._embedding_model_name = embedding_model
+        self._eval_max_contexts = eval_max_contexts if eval_max_contexts is not None else config.eval_max_contexts
+        self._eval_context_max_chars = eval_context_max_chars if eval_context_max_chars is not None else config.eval_context_max_chars
         self._sub_evaluator = None
         self.llm = OpenAICompatibleClient(
             config,
@@ -226,7 +230,12 @@ class EvaluationEngine:
             if self._sub_evaluator is None:
                 from app.services.ragas_evaluator import RagasEvaluator
 
-                self._sub_evaluator = RagasEvaluator(self.config, self.llm)
+                self._sub_evaluator = RagasEvaluator(
+                    self.config,
+                    self.llm,
+                    max_contexts=self._eval_max_contexts,
+                    context_max_chars=self._eval_context_max_chars,
+                )
             return self._sub_evaluator.evaluate_one(item)
 
         sample, response = item
@@ -238,7 +247,11 @@ class EvaluationEngine:
         return self._evaluate_with_rules(sample, response)
 
     def _evaluate_with_llm(self, sample: EvalSample | None, response: SystemResponse) -> EvalResult:
-        system_prompt = "你是严格的中文 RAG 评测裁判。只输出 JSON，不要输出解释。"
+        n = self._eval_max_contexts
+        c = self._eval_context_max_chars
+        trimmed_contexts = [ctx[:c] for ctx in response.retrieved_contexts[:n]]
+        trimmed_citations = [cit[:c] for cit in response.citations[:n]]
+        system_prompt = "你是严格的中文或英文的 RAG 系统评测专家裁判。只输出 JSON，不要输出解释。"
         user_prompt = f"""
 请对系统回答进行评分，所有分数范围为 0 到 1。
 评分定义：
@@ -248,8 +261,8 @@ class EvaluationEngine:
 参考答案：{response.reference_answer or (sample.reference_answer if sample else "")}
 预期证据：{sample.expected_evidence if sample else ""}
 系统答案：{response.answer}
-检索上下文：{response.retrieved_contexts}
-引用：{response.citations}
+检索上下文：{trimmed_contexts}
+引用：{trimmed_citations}
 
 输出 JSON：
 {{

@@ -39,9 +39,17 @@ class RagasEvaluator:
       context_precision, context_recall, context_relevance, evidence_coverage
     """
 
-    def __init__(self, config: "AppConfig", llm: OpenAICompatibleClient):
+    def __init__(
+        self,
+        config: "AppConfig",
+        llm: OpenAICompatibleClient,
+        max_contexts: int = 5,
+        context_max_chars: int = 500,
+    ):
         self.config = config
         self.llm = llm
+        self.max_contexts = max_contexts
+        self.context_max_chars = context_max_chars
 
     def evaluate_one(self, item: tuple) -> EvalResult:
         sample, response = item
@@ -118,7 +126,7 @@ class RagasEvaluator:
         """Decompose answer into statements; verify each against contexts."""
         if not contexts:
             return _si(0.5, "无检索上下文，忠实性无法验证。")
-        ctx = "\n---\n".join(c[:600] for c in contexts[:5])
+        ctx = "\n---\n".join(c[:self.context_max_chars] for c in contexts[:self.max_contexts])
         data = self._call(f"""
 将答案分解为独立的原子陈述，判断每条陈述是否可从检索上下文直接推断。
 答案：{answer}
@@ -176,7 +184,7 @@ class RagasEvaluator:
 
     def _context_precision(self, question: str, reference: str, contexts: list[str]) -> ScoreItem:
         """Single LLM call to evaluate all contexts at once."""
-        ctx_list = json.dumps([c[:400] for c in contexts[:5]], ensure_ascii=False)
+        ctx_list = json.dumps([c[:self.context_max_chars] for c in contexts[:self.max_contexts]], ensure_ascii=False)
         data = self._call(f"""
 对每个检索片段，判断它是否有助于回答问题（参考标准答案判断）。
 问题：{question}
@@ -194,7 +202,7 @@ class RagasEvaluator:
         """Decompose reference into statements; verify each is attributable to contexts."""
         if not reference or not contexts:
             return _si(0.0, "缺少参考答案或上下文。")
-        ctx = "\n---\n".join(c[:600] for c in contexts[:5])
+        ctx = "\n---\n".join(c[:self.context_max_chars] for c in contexts[:self.max_contexts])
         data = self._call(f"""
 将参考答案分解为独立的事实陈述，判断每条陈述是否可从检索上下文归因。
 参考答案：{reference}
@@ -209,7 +217,7 @@ class RagasEvaluator:
         return _si(score, data.get("reason", ""))
 
     def _context_relevance(self, question: str, contexts: list[str]) -> ScoreItem:
-        ctx_list = "\n".join(f"{i+1}. {c[:300]}" for i, c in enumerate(contexts[:5]))
+        ctx_list = "\n".join(f"{i+1}. {c[:self.context_max_chars]}" for i, c in enumerate(contexts[:self.max_contexts]))
         data = self._call(f"""
 评估检索上下文对回答以下问题的整体相关性，打分 0-1。
 问题：{question}
@@ -222,7 +230,7 @@ class RagasEvaluator:
     def _evidence_coverage(self, expected: str, contexts: list[str]) -> ScoreItem:
         if not expected or not contexts:
             return _si(0.0, "缺少期望证据或上下文。")
-        ctx = "\n---\n".join(c[:500] for c in contexts[:5])
+        ctx = "\n---\n".join(c[:self.context_max_chars] for c in contexts[:self.max_contexts])
         data = self._call(f"""
 判断期望证据在检索上下文中的覆盖程度，打分 0-1。
 期望证据：{expected}
