@@ -1231,7 +1231,7 @@ def render_export_cards() -> None:
             <div class="rag-export-head">
               <div class="rag-export-icon">▤</div>
               <div>
-                <div class="rag-export-title">生成 Markdown / PDF 报告</div>
+                <div class="rag-export-title">生成 Markdown 报告</div>
                 <div class="rag-export-desc">生成专业评测报告，适合项目汇报、评审和阶段性归档。</div>
               </div>
             </div>
