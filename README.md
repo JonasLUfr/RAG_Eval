@@ -30,9 +30,7 @@ docker compose up -d --build
 
 ## 其他文档
 
-- [Eval_Design.md](Eval_Design.md) — 评估算法设计与实现
 - [DEPLOYMENT.md](DEPLOYMENT.md) — 服务器部署指南
-- [Delivery_Review.md](Delivery_Review.md) — DEMO 交付评估
 - [app/USER_GUIDE.md](app/USER_GUIDE.md) — 用户操作指南
 - [app/DEVELOPMENT_LOG.md](app/DEVELOPMENT_LOG.md) — 开发日志
 

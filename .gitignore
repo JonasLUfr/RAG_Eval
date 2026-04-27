@@ -28,4 +28,10 @@ app/exports/
 Thumbs.db
 *.swp
 *.swo
+
+# Internal-only docs (not for public release)
 Eval_Design.md
+Delivery_Review.md
+
+# Local Claude Code settings
+.claude/settings.local.json
