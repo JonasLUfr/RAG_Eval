@@ -27,6 +27,8 @@ class AppConfig:
     # RAGAS 上下文截断参数默认值（适配大多数 RAG 系统，用户可在评估页面自定义）
     eval_max_contexts: int = 5
     eval_context_max_chars: int = 500
+    # 单次评估 LLM 调用次数硬上限，用于防止误操作烧钱（仅作用于 llm_judge / ragas）
+    max_llm_calls_per_run: int = 5000
 
 
 def load_config() -> AppConfig:
@@ -44,6 +46,7 @@ def load_config() -> AppConfig:
         llm_api_key=os.getenv("LLM_API_KEY", ""),
         llm_model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
         judge_model=os.getenv("JUDGE_MODEL", os.getenv("LLM_MODEL", "gpt-4o-mini")),
+        max_llm_calls_per_run=int(os.getenv("RAG_EVAL_MAX_LLM_CALLS_PER_RUN", "5000")),
     )
     cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
     cfg.export_dir.mkdir(parents=True, exist_ok=True)

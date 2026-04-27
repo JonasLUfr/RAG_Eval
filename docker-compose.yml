@@ -1,0 +1,18 @@
+services:
+  rag-eval:
+    build: .
+    image: rag-eval:latest
+    container_name: rag-eval
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./app/data:/app/app/data
+      - ./app/exports:/app/app/exports
+    environment:
+      LLM_API_BASE: ${LLM_API_BASE:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      JUDGE_MODEL: ${JUDGE_MODEL:-gpt-4o-mini}
+      RAG_EVAL_MAX_LLM_CALLS_PER_RUN: ${RAG_EVAL_MAX_LLM_CALLS_PER_RUN:-5000}
+      RAG_EVAL_MAX_EVAL: ${RAG_EVAL_MAX_EVAL:-300}
+    restart: unless-stopped

@@ -264,8 +264,22 @@ class EvaluationEngine:
         samples_by_id: dict[str, EvalSample] | None = None,
         progress_callback: callable | None = None,
     ) -> list[EvalResult]:
+        import time
         items = [(samples_by_id.get(r.question_id) if samples_by_id else None, r) for r in responses]
-        return self.executor.run(items, self.evaluate_one, progress_callback)
+        logger.info("eval_batch_start mode=%s samples=%d", self._mode, len(items))
+        t0 = time.monotonic()
+        try:
+            results = self.executor.run(items, self.evaluate_one, progress_callback)
+        except Exception:
+            logger.exception("eval_batch_failed mode=%s samples=%d", self._mode, len(items))
+            raise
+        elapsed = time.monotonic() - t0
+        failed = sum(1 for r in results if not r.scores)
+        logger.info(
+            "eval_batch_done mode=%s samples=%d failed=%d elapsed_sec=%.1f",
+            self._mode, len(results), failed, elapsed,
+        )
+        return results
 
     def evaluate_one(self, item: tuple[EvalSample | None, SystemResponse]) -> EvalResult:
         if self._mode == "embedding":

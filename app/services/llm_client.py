@@ -66,14 +66,18 @@ class OpenAICompatibleClient:
             ],
             "temperature": temperature,
         }
-        resp = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=timeout or self.config.request_timeout_seconds,
-            proxies=self._proxies(),
-        )
-        resp.raise_for_status()
+        try:
+            resp = requests.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=timeout or self.config.request_timeout_seconds,
+                proxies=self._proxies(),
+            )
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            logger.warning("llm_call_failed model=%s url=%s err=%s", self.model, url, exc)
+            raise
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 

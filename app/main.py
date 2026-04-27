@@ -2188,6 +2188,22 @@ with tab_eval:
                 _eval_max_contexts = int(_max_ctx_input)
                 _eval_context_max_chars = int(_max_chars_input)
 
+        _calls_per_sample = {"rule": 0, "embedding": 0, "llm_judge": 1, "ragas": 8}.get(eval_mode, 0)
+        _planned_samples = min(len(responses), config.default_max_eval_questions)
+        _planned_calls = _calls_per_sample * _planned_samples
+        if _calls_per_sample > 0:
+            st.caption(
+                f"预计 LLM 调用次数：**{_planned_calls}** "
+                f"（{eval_mode} 模式 × {_planned_samples} 条样本，每条 {_calls_per_sample} 次）。"
+                f" 按 gpt-4o-mini 单价粗估约 $"
+                f"{_planned_calls * 0.0008:.2f}（实际以你所用模型为准）。"
+            )
+            if _planned_calls > config.max_llm_calls_per_run:
+                st.error(
+                    f"超过单次评估硬上限（{config.max_llm_calls_per_run} 次）。"
+                    f"请减少样本数或在环境变量 RAG_EVAL_MAX_LLM_CALLS_PER_RUN 中调整。"
+                )
+
         _btn_spacer, _btn_col = st.columns([5, 1.4])
         with _btn_col:
             start_eval = st.button("开始 / 重新评估", type="primary", use_container_width=True)
@@ -2195,6 +2211,11 @@ with tab_eval:
             _ok = True
             if eval_mode in {"ragas", "llm_judge"} and not (_ragas_base and _ragas_key):
                 st.error("请填写所选评估方式的 API Base 和 API Key。")
+                _ok = False
+            if _ok and _planned_calls > config.max_llm_calls_per_run:
+                st.error(
+                    f"调用次数 {_planned_calls} 超过硬上限 {config.max_llm_calls_per_run}，已阻止启动。"
+                )
                 _ok = False
             if _ok:
                 limited = responses[: config.default_max_eval_questions]
