@@ -75,11 +75,21 @@ class EmbeddingEvaluator:
         if not response.success or not answer.strip():
             return self._empty_result(response, "答案为空或请求失败。")
 
+        from app.services.evaluator import is_answer_only
+        if is_answer_only(response):
+            contexts = []  # 排除 [""] 这类伪空列表
+
         m = self.model
         sim_ref = _cos_sim(m, answer, reference) if reference else 0.5
         sim_q = _cos_sim(m, answer, question)
 
-        if contexts:
+        scores = {
+            "correctness": _si(sim_ref, "答案与参考答案的语义相似度（嵌入模型计算）。"),
+            "relevance": _si(max(sim_q, sim_ref * 0.7), "答案与问题的语义相关性。"),
+            "completeness": _si(sim_ref, "答案语义覆盖参考答案的程度（嵌入相似度估计）。"),
+        }
+        answer_only = len(contexts) == 0
+        if not answer_only:
             sim_ctx = max(_cos_sim(m, answer, ctx) for ctx in contexts)
             ctx_q_sims = [_cos_sim(m, question, ctx) for ctx in contexts]
             ctx_relevance = mean(ctx_q_sims)
@@ -90,28 +100,18 @@ class EmbeddingEvaluator:
                 if expected_evidence else ctx_recall
             )
             hit = 1.0 if ctx_relevance > 0.4 or evidence_cov > 0.4 else 0.0
-        else:
-            sim_ctx = sim_ref * 0.8
-            ctx_relevance = ctx_precision = ctx_recall = evidence_cov = hit = 0.0
-
-        hallucination = _clamp(1.0 - sim_ctx)
-
-        scores = {
-            "correctness": _si(sim_ref, "答案与参考答案的语义相似度（嵌入模型计算）。"),
-            "relevance": _si(max(sim_q, sim_ref * 0.7), "答案与问题的语义相关性。"),
-            "faithfulness": _si(sim_ctx, "答案与检索上下文的语义匹配程度。"),
-            "completeness": _si(sim_ref, "答案语义覆盖参考答案的程度（嵌入相似度估计）。"),
-            "hallucination_risk": ScoreItem(
+            hallucination = _clamp(1.0 - sim_ctx)
+            scores["faithfulness"] = _si(sim_ctx, "答案与检索上下文的语义匹配程度。")
+            scores["hallucination_risk"] = ScoreItem(
                 raw_score=round(hallucination, 4),
                 normalized_score=round(hallucination, 4),
                 reason="答案缺乏上下文支撑的部分估计（越低越好）。",
-            ),
-            "hit_rate": _si(hit, "检索上下文是否命中了与问题相关的内容。"),
-            "context_relevance": _si(ctx_relevance, "检索上下文与问题的语义相关性均值。"),
-            "context_precision": _si(ctx_precision, "检索片段中相关片段的比例（语义阈值 0.4）。"),
-            "context_recall": _si(ctx_recall, "参考答案内容被检索上下文覆盖的程度。"),
-            "evidence_coverage": _si(evidence_cov, "期望证据被检索上下文覆盖的程度。"),
-        }
+            )
+            scores["hit_rate"] = _si(hit, "检索上下文是否命中了与问题相关的内容。")
+            scores["context_relevance"] = _si(ctx_relevance, "检索上下文与问题的语义相关性均值。")
+            scores["context_precision"] = _si(ctx_precision, "检索片段中相关片段的比例（语义阈值 0.4）。")
+            scores["context_recall"] = _si(ctx_recall, "参考答案内容被检索上下文覆盖的程度。")
+            scores["evidence_coverage"] = _si(evidence_cov, "期望证据被检索上下文覆盖的程度。")
 
         agg = [
             (1 - scores["hallucination_risk"].normalized_score) if k == "hallucination_risk"
@@ -121,12 +121,13 @@ class EmbeddingEvaluator:
         normalized = mean(agg)
         labels = self._failure_labels(response, scores)
 
+        prefix = "[仅答案模式] " if answer_only else ""
         return EvalResult(
             question_id=response.question_id,
             response_id=response.response_id,
             scores=scores,
             normalized_score=round(normalized, 4),
-            judge_reason=f"语义嵌入评分（模型：{self.model_name}）",
+            judge_reason=f"{prefix}语义嵌入评分（模型：{self.model_name}）",
             judge_model=f"embedding:{self.model_name}",
             score_version=self.config.score_version,
             failure_labels=labels,
@@ -136,15 +137,15 @@ class EmbeddingEvaluator:
         if not response.success:
             return ["cannot_judge"]
         labels = []
-        if scores["correctness"].normalized_score < 0.4:
+        if "correctness" in scores and scores["correctness"].normalized_score < 0.4:
             labels.append("wrong_answer")
-        if scores["completeness"].normalized_score < 0.4:
+        if "completeness" in scores and scores["completeness"].normalized_score < 0.4:
             labels.append("incomplete_answer")
-        if scores["faithfulness"].normalized_score < 0.4:
+        if "faithfulness" in scores and scores["faithfulness"].normalized_score < 0.4:
             labels.append("unsupported_answer")
-        if response.retrieved_contexts and scores["hit_rate"].normalized_score < 0.5:
+        if response.retrieved_contexts and "hit_rate" in scores and scores["hit_rate"].normalized_score < 0.5:
             labels.append("retrieval_issue")
-        if response.retrieved_contexts and scores["evidence_coverage"].normalized_score < 0.4:
+        if response.retrieved_contexts and "evidence_coverage" in scores and scores["evidence_coverage"].normalized_score < 0.4:
             labels.append("missing_evidence")
         return labels
 

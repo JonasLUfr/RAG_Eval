@@ -6,6 +6,7 @@ from statistics import mean
 import pandas as pd
 
 from app.models import EvalResult, ExperimentRun, SystemResponse
+from app.services.evaluator import is_answer_only
 
 
 def _to_float(value, default: float = 0.0) -> float:
@@ -23,6 +24,7 @@ def summarize_run(
     results: list[EvalResult],
 ) -> dict:
     success_rate = sum(1 for r in responses if r.success) / len(responses) if responses else 0.0
+    answer_only_count = sum(1 for r in responses if is_answer_only(r))
     latency_values = [_to_float(r.latency_ms) for r in responses if r.latency_ms not in (None, "")]
     token_values = [_to_float(r.token_usage) for r in responses if r.token_usage not in (None, "")]
     labels = Counter(label for result in results for label in result.failure_labels)
@@ -47,6 +49,7 @@ def summarize_run(
         "estimated_cost": estimated_cost,
         "failure_distribution": dict(labels),
         "metric_summary": metric_summary,
+        "answer_only_count": answer_only_count,
     }
 
 

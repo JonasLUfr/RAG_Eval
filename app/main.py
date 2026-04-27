@@ -22,6 +22,7 @@ from app.services.evaluator import (
     METRIC_DETAILED_INFO,
     METRIC_MODE_EXPLANATIONS,
     METRIC_USER_INFO,
+    is_answer_only,
 )
 from app.services.exporter import ExportCenter
 from app.services.importer import dataframe_to_responses, dataframe_to_samples, read_uploaded_table
@@ -43,6 +44,27 @@ try:
     _HAS_PYARROW = True
 except ImportError:
     _HAS_PYARROW = False
+
+
+def _answer_only_badge(responses: list[SystemResponse]) -> str | None:
+    """若批次内存在仅答案模式样本，返回提示文案；否则返回 None。
+
+    检测复用 evaluator.is_answer_only：判定标准为
+      retrieved_contexts 为空列表/None **且** citations 为空列表/None。
+    与评估器逐样本判定使用同一 predicate，保证显示数 = 实际触发数。
+    """
+    if not responses:
+        return None
+    n = sum(1 for r in responses if is_answer_only(r))
+    if n == 0:
+        return None
+    total = len(responses)
+    return (
+        f"本批 {total} 条样本中，**{n} 条**因被测系统未返回检索证据（无 contexts 且无 citations），"
+        "已自动按「仅答案模式」评估，仅产出 3 个证据无关指标："
+        "**correctness / relevance / completeness**。"
+        "其余 7 个指标对这些样本不适用，因此 scores 字典与综合得分均按 3 指标聚合，避免假 0 分拖累分数。"
+    )
 
 
 def _show_df(df: pd.DataFrame, *, hide_index: bool = True, column_config=None, **_) -> None:
@@ -1890,6 +1912,9 @@ with tab_experiment:
                     )
                     store.save_experiment(run)
                     store.save_system_responses(run.run_id, responses)
+                    badge = _answer_only_badge(responses)
+                    if badge:
+                        st.info(badge)
                     if auto_eval_import:
                         with st.spinner("正在根据导入的 RAG 回答执行评估..."):
                             results, summary = evaluate_run_now(run, responses, approved_samples)
@@ -1983,6 +2008,9 @@ with tab_experiment:
                     )
                     store.save_experiment(run)
                     store.save_system_responses(run.run_id, responses)
+                    badge = _answer_only_badge(responses)
+                    if badge:
+                        st.info(badge)
                     if auto_eval_api:
                         with st.spinner("API 响应已保存，正在执行评估..."):
                             results, summary = evaluate_run_now(run, responses, selected_samples)
@@ -2288,6 +2316,9 @@ with tab_eval:
                 if run.aggregate.get("llm_guidance"):
                     summary["llm_guidance"] = run.aggregate.get("llm_guidance")
             render_summary_card(overall_judge_summary(summary, results))
+            badge = _answer_only_badge(responses)
+            if badge:
+                st.info(badge)
             combo_findings = summary.get("metric_combo_findings") or metric_combo_findings(summary.get("metric_summary", {}))
             if combo_findings:
                 st.caption("指标叠加诊断")

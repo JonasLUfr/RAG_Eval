@@ -33,6 +33,26 @@ RETRIEVAL_METRICS = [
 ]
 
 
+# 仅答案模式：被测系统未返回 retrieved_contexts/citations 时，
+# 只评估证据无关的 3 个答案侧指标，避免把"无证据"误判成"低忠实性/高幻觉"。
+ANSWER_ONLY_METRICS = ["correctness", "relevance", "completeness"]
+
+
+def is_answer_only(response: SystemResponse) -> bool:
+    """被测系统未提供任何检索证据（既无上下文也无引用）。
+
+    判定为「真实非空」的标准：列表中至少存在一个去除首尾空白后非空的字符串。
+    这样可正确识别 importer 产生的 [""]、[" "] 等"空内容包装"——
+    它们在语义上等价于无证据，但 list 本身 truthy，简单的 `not list` 会漏判。
+    """
+    def _has_real_content(items) -> bool:
+        if not items:
+            return False
+        return any(str(x).strip() for x in items)
+
+    return not (_has_real_content(response.retrieved_contexts) or _has_real_content(response.citations))
+
+
 METRIC_USER_INFO: dict[str, tuple[str, str]] = {
     "correctness": ("正确性", "回答与参考答案是否一致"),
     "relevance": ("相关性", "回答是否直接回答了问题"),
@@ -313,6 +333,8 @@ class EvaluationEngine:
         return self._evaluate_with_rules(sample, response)
 
     def _evaluate_with_llm(self, sample: EvalSample | None, response: SystemResponse) -> EvalResult:
+        if is_answer_only(response):
+            return self._evaluate_with_llm_answer_only(sample, response)
         n = self._eval_max_contexts
         c = self._eval_context_max_chars
         trimmed_contexts = [ctx[:c] for ctx in response.retrieved_contexts[:n]]
@@ -352,6 +374,41 @@ class EvaluationEngine:
         }
         return self._build_result(response, scores, data.get("judge_reason", ""), data.get("failure_labels", []))
 
+    def _evaluate_with_llm_answer_only(self, sample: EvalSample | None, response: SystemResponse) -> EvalResult:
+        """仅答案模式：被测系统不返回检索上下文，只评估 3 个证据无关的指标。"""
+        reference = response.reference_answer or (sample.reference_answer if sample else "")
+        system_prompt = "你是严格的 RAG 系统评测专家裁判。只输出 JSON，不要输出解释。"
+        user_prompt = f"""
+被测系统未提供检索上下文，请仅基于问题、参考答案和系统答案，对以下 3 个指标打分（0-1）：
+- correctness：与参考答案的事实一致性
+- relevance：是否直接回应问题
+- completeness：是否覆盖参考答案的关键要点
+
+问题：{response.question}
+参考答案：{reference}
+系统答案：{response.answer}
+
+输出 JSON：
+{{
+  "scores": {{"correctness": 0.0, "relevance": 0.0, "completeness": 0.0}},
+  "judge_reason": "中文理由",
+  "failure_labels": ["wrong_answer"]
+}}
+"""
+        data = self.llm.chat_json(system_prompt, user_prompt, temperature=0.0)
+        raw = data.get("scores", {}) or {}
+        scores = {
+            name: ScoreItem(
+                raw_score=float(raw.get(name, 0.0)),
+                normalized_score=self._clamp(float(raw.get(name, 0.0))),
+                reason=data.get("judge_reason", ""),
+            )
+            for name in ANSWER_ONLY_METRICS
+            if name in raw
+        }
+        reason = "[仅答案模式] " + data.get("judge_reason", "未提供检索上下文，仅评估答案与参考答案对齐。")
+        return self._build_result(response, scores, reason, data.get("failure_labels", []))
+
     def _evaluate_with_rules(self, sample: EvalSample | None, response: SystemResponse) -> EvalResult:
         reference = response.reference_answer or (sample.reference_answer if sample else "")
         expected_evidence = sample.expected_evidence if sample else ""
@@ -360,10 +417,21 @@ class EvaluationEngine:
 
         overlap_ref = self._overlap(answer, reference) if reference else 0.5
         overlap_question = self._overlap(answer, response.question)
-        overlap_context = self._overlap(answer, contexts_text) if contexts_text else 0.5
-        evidence_overlap = self._overlap(expected_evidence, contexts_text) if expected_evidence and contexts_text else 0.0
-        answer_has_evidence = bool(contexts_text and overlap_context >= 0.18)
         success_score = 1.0 if response.success and answer.strip() else 0.0
+
+        if is_answer_only(response):
+            scores = {
+                "correctness": self._score(overlap_ref * success_score, "与参考答案重合度估计。"),
+                "relevance": self._score(max(overlap_question, overlap_ref) * success_score, "回答与问题相关性估计。"),
+                "completeness": self._score(min(1.0, overlap_ref * 1.15) * success_score, "关键要点覆盖程度估计。"),
+            }
+            labels = self._infer_failure_labels(response, scores)
+            reason = "[仅答案模式] 规则评分：被测系统未提供检索上下文，仅评估答案与参考答案的对齐程度。"
+            return self._build_result(response, scores, reason, labels)
+
+        overlap_context = self._overlap(answer, contexts_text)
+        evidence_overlap = self._overlap(expected_evidence, contexts_text) if expected_evidence else 0.0
+        answer_has_evidence = overlap_context >= 0.18
 
         scores = {
             "correctness": self._score(overlap_ref * success_score, "与参考答案重合度估计。"),
@@ -409,15 +477,15 @@ class EvaluationEngine:
         labels: list[str] = []
         if not response.success:
             return ["cannot_judge"]
-        if scores["correctness"].normalized_score < 0.35:
+        if "correctness" in scores and scores["correctness"].normalized_score < 0.35:
             labels.append("wrong_answer")
-        if scores["completeness"].normalized_score < 0.45:
+        if "completeness" in scores and scores["completeness"].normalized_score < 0.45:
             labels.append("incomplete_answer")
-        if scores["faithfulness"].normalized_score < 0.35:
+        if "faithfulness" in scores and scores["faithfulness"].normalized_score < 0.35:
             labels.append("unsupported_answer")
-        if response.retrieved_contexts and scores["hit_rate"].normalized_score < 0.5:
+        if response.retrieved_contexts and "hit_rate" in scores and scores["hit_rate"].normalized_score < 0.5:
             labels.append("retrieval_issue")
-        if response.retrieved_contexts and scores["evidence_coverage"].normalized_score < 0.35:
+        if response.retrieved_contexts and "evidence_coverage" in scores and scores["evidence_coverage"].normalized_score < 0.35:
             labels.append("missing_evidence")
         return labels
 

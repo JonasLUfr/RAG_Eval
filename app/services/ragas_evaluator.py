@@ -62,20 +62,24 @@ class RagasEvaluator:
         if not response.success or not answer.strip():
             return self._empty_result(response, "答案为空或请求失败。")
 
+        from app.services.evaluator import is_answer_only
+        answer_only = is_answer_only(response)
+        if answer_only:
+            contexts = []  # 排除 [""] 这类伪空列表，避免下游误用
         try:
             scores: dict[str, ScoreItem] = {}
-            scores["faithfulness"] = self._faithfulness(answer, contexts)
             scores["correctness"] = self._correctness(question, answer, reference)
             scores["relevance"] = self._relevance(question, answer)
             scores["completeness"] = self._completeness(answer, reference)
-            faith = scores["faithfulness"].normalized_score
-            scores["hallucination_risk"] = ScoreItem(
-                raw_score=round(1 - faith, 4),
-                normalized_score=round(1 - faith, 4),
-                reason="幻觉风险 = 1 − 忠实性得分。",
-            )
 
-            if contexts:
+            if not answer_only:
+                scores["faithfulness"] = self._faithfulness(answer, contexts)
+                faith = scores["faithfulness"].normalized_score
+                scores["hallucination_risk"] = ScoreItem(
+                    raw_score=round(1 - faith, 4),
+                    normalized_score=round(1 - faith, 4),
+                    reason="幻觉风险 = 1 − 忠实性得分。",
+                )
                 scores["context_precision"] = self._context_precision(question, reference, contexts)
                 scores["context_recall"] = self._context_recall(reference, contexts)
                 scores["context_relevance"] = self._context_relevance(question, contexts)
@@ -85,9 +89,6 @@ class RagasEvaluator:
                     reason="上下文对问题的整体相关性（与上下文相关性一致）。",
                 )
                 scores["evidence_coverage"] = self._evidence_coverage(expected_evidence or reference, contexts)
-            else:
-                for name in ["context_precision", "context_recall", "context_relevance", "hit_rate", "evidence_coverage"]:
-                    scores[name] = ScoreItem(raw_score=0.0, normalized_score=0.0, reason="无检索上下文，跳过。")
         except JudgeCallError as exc:
             logger.warning("RAGAS 评分失败 question_id=%s error=%s", response.question_id, exc)
             return self._empty_result(response, f"RAGAS 评估器失败：{exc}", str(exc))
@@ -100,12 +101,13 @@ class RagasEvaluator:
         normalized = mean(agg)
         labels = self._failure_labels(response, scores)
 
+        judge_reason = "[仅答案模式] RAGAS 算法评分（仅答案侧 3 指标）" if answer_only else "RAGAS 算法评分（LLM 逐步推理）"
         return EvalResult(
             question_id=response.question_id,
             response_id=response.response_id,
             scores=scores,
             normalized_score=round(normalized, 4),
-            judge_reason="RAGAS 算法评分（LLM 逐步推理）",
+            judge_reason=judge_reason,
             judge_model=self.llm.model,
             score_version=self.config.score_version,
             failure_labels=labels,
@@ -243,15 +245,15 @@ class RagasEvaluator:
         if not response.success:
             return ["cannot_judge"]
         labels = []
-        if scores["correctness"].normalized_score < 0.4:
+        if "correctness" in scores and scores["correctness"].normalized_score < 0.4:
             labels.append("wrong_answer")
-        if scores["completeness"].normalized_score < 0.4:
+        if "completeness" in scores and scores["completeness"].normalized_score < 0.4:
             labels.append("incomplete_answer")
-        if scores["faithfulness"].normalized_score < 0.4:
+        if "faithfulness" in scores and scores["faithfulness"].normalized_score < 0.4:
             labels.append("unsupported_answer")
-        if response.retrieved_contexts and scores["hit_rate"].normalized_score < 0.5:
+        if response.retrieved_contexts and "hit_rate" in scores and scores["hit_rate"].normalized_score < 0.5:
             labels.append("retrieval_issue")
-        if response.retrieved_contexts and scores["evidence_coverage"].normalized_score < 0.4:
+        if response.retrieved_contexts and "evidence_coverage" in scores and scores["evidence_coverage"].normalized_score < 0.4:
             labels.append("missing_evidence")
         return labels
 
