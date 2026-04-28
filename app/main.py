@@ -1942,6 +1942,43 @@ with tab_experiment:
             endpoint = st.text_input("外部 RAG / 生成 API 地址", placeholder="https://example.com/query")
             method = st.selectbox("HTTP 方法", ["POST", "GET"])
             headers_json = st.text_area("请求头 JSON", value='{"Content-Type":"application/json"}', height=80)
+            with st.expander("请求体常量字段（可选，适配 Dify 等需要固定参数的接口）", expanded=False):
+                st.caption(
+                    "这里写**所有样本共用**的固定字段，会作为 payload 基底；下方映射的字段在其上层覆盖。"
+                    "outbound key 支持点号路径（如 `inputs.query`）自动展开为嵌套对象。"
+                )
+                static_payload_text = st.text_area(
+                    "常量 JSON",
+                    value="{}",
+                    height=160,
+                    help=(
+                        "【这一栏要不要填】**完全可选**——本系统对常量 JSON 没有任何字段要求，留 `{}` 也能跑。\n"
+                        "只在目标 API 要求一些「与具体问题无关、所有请求共享」的字段时才用得上（典型：Dify、Coze 这类带租户/会话/用户标识的接口）。\n"
+                        "\n"
+                        "【与下方映射的关系】这里的字段是请求体**基底**；下方「请求字段映射」里的字段会**覆盖**同名 key。\n"
+                        "\n"
+                        "─── Dify /chat-messages 参考模板（按需挑选，不是都得填）───\n"
+                        '{\n'
+                        '  "inputs": {},\n'
+                        '  "response_mode": "blocking",\n'
+                        '  "conversation_id": "",\n'
+                        '  "user": "<你自己起一个标识，例如 eval-bot-001>"\n'
+                        '}\n'
+                        "\n"
+                        "【字段说明（哪些 Dify 真的要、哪些可以省）】\n"
+                        "• user：**Dify 一般会要**——它用来做用量统计和限流。建议自己起一个字符串（工号、邮箱前缀、`eval-bot-001` 都行），同一批评估保持一致便于在 Dify 后台过滤这批调用。**不要照抄占位符**。如果你的 Dify 实例没有强制要求，也可以不传。\n"
+                        "• inputs：仅当你的 Dify 应用里**定义了自定义变量**才需要填（如 `{\"lang\": \"zh\"}`）；没有自定义变量传 `{}` 即可，多数版本下整个 key 不写也能过。\n"
+                        "• response_mode：可选，省略时 Dify 通常按服务端默认走。本系统是同步阻塞调用，不要写 `streaming`（流式 SSE 解析不了）；如果你的 Dify 默认就是 `blocking` 可以不写这条。\n"
+                        "• conversation_id：可选。建议**不传或写空字符串**，让每条评估样本独立；只有想测多轮场景时才填上一轮返回的会话 ID。\n"
+                        "\n"
+                        "【最小可跑配置】如果不确定，先只放 `{\"user\": \"你的标识\"}` 试一次；报缺字段再按报错回填。\n"
+                        "\n"
+                        "【其他几栏怎么配（Dify 场景）】\n"
+                        "1. 「请求头 JSON」必须加 `\"Authorization\": \"Bearer app-你的APIKey\"`，这是 Dify 鉴权，省不掉。\n"
+                        "2. 「请求字段映射」改成 `{\"question\": \"query\"}`（Dify 用 `query` 接收问题）。\n"
+                        "3. 「响应字段映射」保留 `answer: answer` 即可；Dify 不返回结构化 contexts/citations，本系统会自动进入「仅答案模式」（只算 correctness/relevance/completeness 三项），结果页有蓝色徽章提示。"
+                    ),
+                )
             col_req, col_resp = st.columns(2)
             with col_req:
                 request_mapping_text = st.text_area(
@@ -1978,6 +2015,7 @@ with tab_experiment:
                     headers_json=headers_json,
                     request_mapping=parse_mapping(request_mapping_text, {"question": "question"}),
                     response_mapping=parse_mapping(response_mapping_text, {"answer": "answer"}),
+                    static_payload_json=static_payload_text,
                 )
                 connector = ExternalAPIConnector(config, connector_config)
                 ok, message = connector.validate()

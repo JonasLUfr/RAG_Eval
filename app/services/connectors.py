@@ -23,6 +23,9 @@ class ConnectorConfig:
     headers_json: str = "{}"
     request_mapping: dict[str, str] = field(default_factory=lambda: {"question": "question"})
     response_mapping: dict[str, str] = field(default_factory=lambda: {"answer": "answer"})
+    # 常量 JSON：作为 payload 基底，支持 Dify 之类需要固定字段（response_mode/user/inputs/...）的接口。
+    # request_mapping 的字段在其上层 overlay；outbound key 支持点号路径（"inputs.query"）实现嵌套。
+    static_payload_json: str = "{}"
 
 
 class ExternalAPIConnector:
@@ -43,6 +46,12 @@ class ExternalAPIConnector:
             json.loads(self.connector_config.headers_json or "{}")
         except json.JSONDecodeError:
             return False, "请求头必须是合法 JSON"
+        try:
+            base = json.loads(self.connector_config.static_payload_json or "{}")
+        except json.JSONDecodeError:
+            return False, "请求体常量字段必须是合法 JSON"
+        if not isinstance(base, dict):
+            return False, "请求体常量字段必须是 JSON 对象（{}），不能是数组或基础类型"
         return True, "连接器配置格式有效"
 
     def run_batch(
@@ -120,10 +129,28 @@ class ExternalAPIConnector:
 
     def _build_payload(self, sample: EvalSample) -> dict[str, Any]:
         source = sample.to_dict()
-        payload: dict[str, Any] = {}
+        try:
+            base = json.loads(self.connector_config.static_payload_json or "{}")
+        except json.JSONDecodeError:
+            base = {}
+        payload: dict[str, Any] = base if isinstance(base, dict) else {}
         for internal_field, outbound_field in self.connector_config.request_mapping.items():
-            payload[outbound_field] = source.get(internal_field, "")
+            if not outbound_field:
+                continue
+            self._set_path(payload, outbound_field, source.get(internal_field, ""))
         return payload
+
+    @staticmethod
+    def _set_path(data: dict[str, Any], path: str, value: Any) -> None:
+        parts = path.split(".")
+        cur = data
+        for part in parts[:-1]:
+            nxt = cur.get(part)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                cur[part] = nxt
+            cur = nxt
+        cur[parts[-1]] = value
 
     def _parse_response(self, sample: EvalSample, raw: dict[str, Any], latency_ms: float) -> SystemResponse:
         mapping = self.connector_config.response_mapping
