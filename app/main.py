@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# 兼容任意启动方式:无论从仓库根目录、app/ 内部、还是绝对路径启动,
+# 都确保顶层包 `app` 可被导入。
+_THIS_FILE = Path(__file__).resolve()
+_REPO_ROOT = _THIS_FILE.parent.parent  # app/ 的父目录
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from html import escape
 from io import StringIO
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
