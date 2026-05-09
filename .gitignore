@@ -33,6 +33,10 @@ Thumbs.db
 Eval_Design.md
 Delivery_Review.md
 
+# Internal tooling: contains real Dify chatflow exports with hardcoded
+# Qdrant / embedding API keys and internal IPs. Keep local only.
+tools/
+
 # Local Claude Code settings
 .claude/settings.local.json
 ReportSummry_Project.docx
