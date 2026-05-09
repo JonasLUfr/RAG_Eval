@@ -34,6 +34,7 @@ from app.services.evaluator import (
     is_answer_only,
 )
 from app.services.exporter import ExportCenter
+from app.services.form_presets import load_preset, redact_headers_json, save_preset
 from app.services.importer import dataframe_to_responses, dataframe_to_samples, read_uploaded_table
 from app.services.llm_client import OpenAICompatibleClient
 from app.services.seed import ensure_seed_data
@@ -1612,17 +1613,24 @@ with tab_testset:
 
         if generation_mode == "使用 LLM 生成":
             st.subheader("LLM 连接")
-            # 初始化 session state，优先使用已保存的值
+            # 初始化 session state，优先级：session > 上次预设（不含 Key）> 环境变量默认
+            _testset_preset = load_preset("testset_llm")
             if "llm_api_base" not in st.session_state:
-                st.session_state.llm_api_base = config.llm_api_base
+                st.session_state.llm_api_base = _testset_preset.get("api_base") or config.llm_api_base
             if "llm_api_key" not in st.session_state:
                 st.session_state.llm_api_key = config.llm_api_key
             if "llm_model_name" not in st.session_state:
-                st.session_state.llm_model_name = config.llm_model
+                st.session_state.llm_model_name = _testset_preset.get("model") or config.llm_model
             if "llm_max_questions" not in st.session_state:
-                st.session_state.llm_max_questions = min(30, config.default_max_generated_questions)
+                st.session_state.llm_max_questions = int(
+                    _testset_preset.get("max_questions") or min(30, config.default_max_generated_questions)
+                )
             if "llm_timeout_seconds" not in st.session_state:
-                st.session_state.llm_timeout_seconds = 60
+                st.session_state.llm_timeout_seconds = int(_testset_preset.get("timeout_seconds") or 60)
+            if "llm_proxy_url" not in st.session_state:
+                st.session_state.llm_proxy_url = _testset_preset.get("proxy_url", "")
+            if _testset_preset:
+                st.caption("已自动回填上次填写的 LLM 配置（API Key 不会保存，请手动补上）。")
 
             col_a, col_b = st.columns(2)
             with col_a:
@@ -1665,6 +1673,7 @@ with tab_testset:
                 include_evidence = st.checkbox("生成期望证据", value=True)
             proxy_url = st.text_input(
                 "代理地址（可选）",
+                value=st.session_state.llm_proxy_url,
                 placeholder="例如：http://127.0.0.1:7890；不填则使用系统环境变量代理",
             )
             st.caption(
@@ -1686,6 +1695,7 @@ with tab_testset:
             st.session_state.llm_model_name = model_name
             st.session_state.llm_max_questions = int(max_questions)
             st.session_state.llm_timeout_seconds = int(timeout_seconds)
+            st.session_state.llm_proxy_url = proxy_url
 
             question_type_text = st.text_area(
                 "本次生成题型要求(推荐填写)",
@@ -1732,6 +1742,13 @@ with tab_testset:
                             for item in generated:
                                 item.review_status = "已通过"
                         store.save_test_cases(project.project_id, generated)
+                        save_preset("testset_llm", {
+                            "api_base": api_base,
+                            "model": model_name,
+                            "max_questions": int(max_questions),
+                            "timeout_seconds": int(timeout_seconds),
+                            "proxy_url": proxy_url,
+                        })
                         st.success(f"LLM 已生成并保存 {len(generated)} 条测试用例。")
                         st.rerun()
                     except Exception as exc:  # noqa: BLE001
@@ -1866,8 +1883,12 @@ with tab_experiment:
         mode = st.radio("输入模式", ["历史结果导入", "外部 API 模式"], horizontal=True)
 
         if mode == "历史结果导入":
-            auto_eval_import = st.checkbox("导入后立即评估", value=True, key="auto_eval_import")
-            st.caption("如果上传的数据已经包含 RAG 回答 answer，导入后可以直接评分；之后仍可在“评估与失败分析”中查看和重评。")
+            auto_eval_import = st.checkbox("导入后立即评估", value=False, key="auto_eval_import")
+            st.caption(
+                "勾选后立即评分，使用的是 **规则评分（字符 Jaccard 重叠）**——速度最快但仅供初筛，不理解语义。"
+                "想用语义嵌入 / RAGAS / LLM 裁判等更精准的方式，请不勾选这里，到「评估与失败分析」里选择评估方式。"
+                "无论是否勾选，导入的数据都会保存，可随时在评估页里重新评分。"
+            )
             uploaded_results = st.file_uploader(
                 "上传历史结果（CSV / Excel / JSON）",
                 type=["csv", "xlsx", "xls", "json"],
@@ -1947,10 +1968,32 @@ with tab_experiment:
                 st.warning("外部 API 模式需要先审核通过测试用例。")
             else:
                 st.success(f"将自动使用 {min(len(approved_samples), int(run_limit))} 条已通过测试题调用外部 RAG API。")
-            auto_eval_api = st.checkbox("API 调用完成后立即评估", value=True, key="auto_eval_api")
-            endpoint = st.text_input("外部 RAG / 生成 API 地址", placeholder="https://example.com/query")
-            method = st.selectbox("HTTP 方法", ["POST", "GET"])
-            headers_json = st.text_area("请求头 JSON", value='{"Content-Type":"application/json"}', height=80)
+            auto_eval_api = st.checkbox("API 调用完成后立即评估", value=False, key="auto_eval_api")
+            st.caption(
+                "勾选后立即评分，使用的是 **规则评分（字符 Jaccard 重叠）**——速度最快但仅供初筛，不理解语义。"
+                "想用语义嵌入 / RAGAS / LLM 裁判等更精准的方式，请不勾选这里，到「评估与失败分析」里选择评估方式。"
+                "无论是否勾选，API 响应都会保存，可随时在评估页里重新评分。"
+            )
+            _api_preset = load_preset("external_api")
+            if _api_preset:
+                st.caption("已自动回填上次填写的外部 API 配置（请求头里的 Authorization / Key 不会保存，请手动补上）。")
+            endpoint = st.text_input(
+                "外部 RAG / 生成 API 地址",
+                value=_api_preset.get("endpoint", ""),
+                placeholder="https://example.com/query",
+            )
+            _method_options = ["POST", "GET"]
+            _method_default = _api_preset.get("method", "POST")
+            method = st.selectbox(
+                "HTTP 方法",
+                _method_options,
+                index=_method_options.index(_method_default) if _method_default in _method_options else 0,
+            )
+            headers_json = st.text_area(
+                "请求头 JSON",
+                value=_api_preset.get("headers_json", '{"Content-Type":"application/json"}'),
+                height=80,
+            )
             with st.expander("请求体常量字段（可选，适配 Dify 等需要固定参数的接口）", expanded=False):
                 st.caption(
                     "这里写**所有样本共用**的固定字段，会作为 payload 基底；下方映射的字段在其上层覆盖。"
@@ -1958,7 +2001,7 @@ with tab_experiment:
                 )
                 static_payload_text = st.text_area(
                     "常量 JSON",
-                    value="{}",
+                    value=_api_preset.get("static_payload_json", "{}"),
                     height=160,
                     help=(
                         "【这一栏要不要填】**完全可选**——本系统对常量 JSON 没有任何字段要求，留 `{}` 也能跑。\n"
@@ -1992,22 +2035,28 @@ with tab_experiment:
             with col_req:
                 request_mapping_text = st.text_area(
                     "请求字段映射：内部字段 -> API 字段",
-                    value=json.dumps({"question": "question", "question_id": "question_id"}, ensure_ascii=False, indent=2),
+                    value=_api_preset.get(
+                        "request_mapping_json",
+                        json.dumps({"question": "question", "question_id": "question_id"}, ensure_ascii=False, indent=2),
+                    ),
                     height=150,
                 )
             with col_resp:
                 response_mapping_text = st.text_area(
                     "响应字段映射：内部字段 -> API JSON 路径",
-                    value=json.dumps(
-                        {
-                            "answer": "answer",
-                            "retrieved_contexts": "retrieved_contexts",
-                            "citations": "citations",
-                            "latency_ms": "latency_ms",
-                            "token_usage": "token_usage",
-                        },
-                        ensure_ascii=False,
-                        indent=2,
+                    value=_api_preset.get(
+                        "response_mapping_json",
+                        json.dumps(
+                            {
+                                "answer": "answer",
+                                "retrieved_contexts": "retrieved_contexts",
+                                "citations": "citations",
+                                "latency_ms": "latency_ms",
+                                "token_usage": "token_usage",
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
                     ),
                     height=150,
                 )
@@ -2031,6 +2080,14 @@ with tab_experiment:
                 if not ok:
                     st.error(message)
                 else:
+                    save_preset("external_api", {
+                        "endpoint": endpoint,
+                        "method": method,
+                        "headers_json": redact_headers_json(headers_json),
+                        "static_payload_json": static_payload_text,
+                        "request_mapping_json": request_mapping_text,
+                        "response_mapping_json": response_mapping_text,
+                    })
                     progress_bar = st.progress(0)
                     status = st.empty()
 
@@ -2181,13 +2238,22 @@ with tab_eval:
                 _ragas_base, _ragas_key, _ragas_model = _existing_base, _existing_key, _existing_model
                 st.caption(f"模型：{_ragas_model}")
             else:
+                _ragas_preset = load_preset("eval_ragas")
+                if _ragas_preset:
+                    st.caption("已自动回填上次填写的 RAGAS API 配置（API Key 不会保存，请手动补上）。")
                 _rcol1, _rcol2 = st.columns(2)
                 with _rcol1:
                     _ragas_base = st.text_input(
-                        "API Base", value=config.llm_api_base, key="ragas_api_base_input",
+                        "API Base",
+                        value=_ragas_preset.get("api_base") or config.llm_api_base,
+                        key="ragas_api_base_input",
                         placeholder="https://api.openai.com/v1",
                     )
-                    _ragas_model = st.text_input("模型名", value=config.llm_model, key="ragas_model_input")
+                    _ragas_model = st.text_input(
+                        "模型名",
+                        value=_ragas_preset.get("model") or config.llm_model,
+                        key="ragas_model_input",
+                    )
                 with _rcol2:
                     _ragas_key = st.text_input(
                         "API Key", type="password", value=config.llm_api_key, key="ragas_api_key_input",
@@ -2207,13 +2273,22 @@ with tab_eval:
                 _ragas_base, _ragas_key, _ragas_model = _existing_base, _existing_key, _existing_model
                 st.caption(f"裁判模型：{_ragas_model}")
             else:
+                _judge_preset = load_preset("eval_llm_judge")
+                if _judge_preset:
+                    st.caption("已自动回填上次填写的裁判 API 配置（API Key 不会保存，请手动补上）。")
                 _jcol1, _jcol2 = st.columns(2)
                 with _jcol1:
                     _ragas_base = st.text_input(
-                        "API Base", value=config.llm_api_base, key="llm_judge_api_base_input",
+                        "API Base",
+                        value=_judge_preset.get("api_base") or config.llm_api_base,
+                        key="llm_judge_api_base_input",
                         placeholder="https://api.openai.com/v1",
                     )
-                    _ragas_model = st.text_input("裁判模型ID", value=config.judge_model, key="llm_judge_model_input")
+                    _ragas_model = st.text_input(
+                        "裁判模型ID",
+                        value=_judge_preset.get("model") or config.judge_model,
+                        key="llm_judge_model_input",
+                    )
                 with _jcol2:
                     _ragas_key = st.text_input(
                         "API Key", type="password", value=config.llm_api_key, key="llm_judge_api_key_input",
@@ -2293,6 +2368,17 @@ with tab_eval:
                 )
                 _ok = False
             if _ok:
+                # 评估方式校验通过即视为「这套配置确实在用」，写回最近预设（不含 Key）
+                if eval_mode == "ragas":
+                    save_preset("eval_ragas", {
+                        "api_base": _ragas_base,
+                        "model": _ragas_model,
+                    })
+                elif eval_mode == "llm_judge":
+                    save_preset("eval_llm_judge", {
+                        "api_base": _ragas_base,
+                        "model": _ragas_model,
+                    })
                 limited = responses[: config.default_max_eval_questions]
 
                 # 嵌入模式：首次需要下载模型（~470MB），在进度条启动前显式预加载

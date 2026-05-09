@@ -17,7 +17,7 @@ class AppConfig:
     default_max_generated_questions: int = 200
     default_max_eval_questions: int = 300
     max_workers: int = 5
-    request_timeout_seconds: int = 30
+    request_timeout_seconds: int = 90
     retry_times: int = 2
     llm_api_base: str = ""
     llm_api_key: str = ""
@@ -40,7 +40,7 @@ def load_config() -> AppConfig:
         default_max_generated_questions=int(os.getenv("RAG_EVAL_MAX_GENERATED", "200")),
         default_max_eval_questions=int(os.getenv("RAG_EVAL_MAX_EVAL", "300")),
         max_workers=int(os.getenv("RAG_EVAL_MAX_WORKERS", "5")),
-        request_timeout_seconds=int(os.getenv("RAG_EVAL_TIMEOUT", "30")),
+        request_timeout_seconds=int(os.getenv("RAG_EVAL_TIMEOUT", "90")),
         retry_times=int(os.getenv("RAG_EVAL_RETRY", "2")),
         llm_api_base=os.getenv("LLM_API_BASE", ""),
         llm_api_key=os.getenv("LLM_API_KEY", ""),
@@ -52,4 +52,3 @@ def load_config() -> AppConfig:
     cfg.export_dir.mkdir(parents=True, exist_ok=True)
     cfg.log_dir.mkdir(parents=True, exist_ok=True)
     return cfg
-
