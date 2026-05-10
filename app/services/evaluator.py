@@ -11,6 +11,7 @@ from app.models import EvalResult, EvalSample, ScoreItem, SystemResponse
 from app.models.schemas import FAILURE_LABELS
 from app.services.executor import BatchExecutor
 from app.services.llm_client import OpenAICompatibleClient
+from app.services.rank_metrics import compute_rank_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -293,6 +294,25 @@ class EvaluationEngine:
         except Exception:
             logger.exception("eval_batch_failed mode=%s samples=%d", self._mode, len(items))
             raise
+
+        # 统一注入 rank-aware 检索指标（MRR / Recall@k / Precision@k）。
+        # 与具体 evaluator 解耦，对 4 种模式（rule / embedding / ragas / llm_judge）一视同仁。
+        # 仅当样本具备 expected_evidence 且至少一条上下文（retrieved_contexts 或 citations）时才注入。
+        # contexts 拼接顺序与 ragas_evaluator / 规则评分保持一致：retrieved_contexts 在前，citations 在后。
+        responses_by_id = {r.response_id: r for r in responses}
+        for result in results:
+            response = responses_by_id.get(result.response_id)
+            sample = samples_by_id.get(result.question_id) if samples_by_id else None
+            if response is None or sample is None:
+                continue
+            evidence = sample.expected_evidence or ""
+            contexts = [str(c) for c in (response.retrieved_contexts or []) + (response.citations or [])]
+            if not evidence.strip() or not contexts:
+                continue
+            rank_scores = compute_rank_metrics(contexts, evidence)
+            if rank_scores:
+                result.scores.update(rank_scores)
+
         elapsed = time.monotonic() - t0
         failed = sum(1 for r in results if not r.scores)
         logger.info(

@@ -23,7 +23,7 @@ from app.core.config import load_config
 from app.core.logging_config import setup_logging
 from app.models import EvalSample, ExperimentRun, ProjectContext, SystemResponse
 from app.models.schemas import FAILURE_LABELS
-from app.services.comparison import comparison_dataframe, summarize_run
+from app.services.comparison import bootstrap_ci, comparison_dataframe, paired_diff_stats, summarize_run
 from app.services.connectors import ConnectorConfig, ExternalAPIConnector
 from app.services.evaluator import (
     EvaluationEngine,
@@ -37,6 +37,19 @@ from app.services.exporter import ExportCenter
 from app.services.form_presets import load_preset, redact_headers_json, save_preset
 from app.services.importer import dataframe_to_responses, dataframe_to_samples, read_uploaded_table
 from app.services.llm_client import OpenAICompatibleClient
+from app.services.rank_metrics import (
+    DEFAULT_KS as RANK_KS,
+    RANK_METRIC_TOOLTIPS,
+    rank_metric_names,
+)
+from app.services.meta_eval import (
+    compute_alignment,
+    export_template_csv,
+    import_annotations,
+    load_meta_eval,
+    sample_for_review,
+    save_meta_eval,
+)
 from app.services.seed import ensure_seed_data
 from app.services.source_loader import SourceFileTooLargeError, parse_source_file
 from app.services.testset_generator import TestsetGenerator, TestsetLLMSettings
@@ -44,7 +57,7 @@ from app.storage import SQLiteStore
 
 
 st.set_page_config(
-    page_title="RAG_Eval 评测工作台",
+    page_title="RAG_Eval 综合评测工作台",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -335,7 +348,7 @@ def response_review_dataframe(
 
 def overall_judge_summary(summary: dict, results: list) -> str:
     if not results:
-        return "当前运行还没有评分结果。请先执行评估。"
+        return "当前运行还没有评分结果哦, 请先执行评估。"
     score = summary.get("avg_score", 0)
     success_rate = summary.get("success_rate", 0)
     failures = summary.get("failure_distribution", {})
@@ -392,6 +405,29 @@ def metric_combo_findings(metric_summary: dict[str, float]) -> list[str]:
         findings.append("检索命中尚可 + 精确率低：噪声偏高，建议加强重排与去噪。")
     if hallucination > 0.55 and evidence < 0.45:
         findings.append("幻觉风险高 + 证据覆盖低：回答与证据脱节，建议增加拒答和证据门控。")
+
+    # rank-aware 检索诊断
+    mrr = float(metric_summary.get("mrr", 0))
+    recall_at_1 = float(metric_summary.get("recall_at_1", 0))
+    recall_at_5 = float(metric_summary.get("recall_at_5", 0))
+    if recall_at_5 >= 0.7 and mrr < 0.4:
+        findings.append("Recall@5 高 + MRR 低：证据找回了但排在尾部，强烈建议加重排器（reranker）。")
+    if recall_at_1 < 0.3 and recall_at_5 >= 0.6:
+        findings.append("Recall@1 低 + Recall@5 较高：首条命中差但前 5 条能补齐，"
+                        "短上下文窗口下表现会显著下降，可优化 query 改写或重排打分。")
+
+    # Precision@k 噪声诊断
+    precision_at_1 = float(metric_summary.get("precision_at_1", 0))
+    precision_at_3 = float(metric_summary.get("precision_at_3", 0))
+    precision_at_5 = float(metric_summary.get("precision_at_5", 0))
+    if precision_at_1 >= 0.6 and precision_at_5 < 0.35:
+        findings.append("Precision@1 高 + Precision@5 低：首位准但后续位掺入大量无关 chunk，"
+                        "建议**减小 top-K 返回窗口**（不是增大）以减少噪声进入 LLM。")
+    if recall_at_5 >= 0.5 and faithfulness < 0.3 and precision_at_3 < 0.4:
+        findings.append("Recall@5 不低 + Faithfulness 极低 + Precision@3 低：检索召回基本正常，"
+                        "但答案大量超出证据范围（生成端过度展开）。优先改 system prompt 强制"
+                        "「仅基于证据回答」，而非增加 top-K。")
+
     if not findings:
         findings.append("未出现明显的高风险指标叠加，建议继续按低分样本做针对性优化。")
     return findings
@@ -421,6 +457,13 @@ def generate_llm_guidance(
 2. 再给出3-5条修改方向
 3. 必须指出指标或指标叠加意味着什么问题
 4. 控制在260字以内
+
+**重要约束（违反会给出错误建议）**：
+- 若 mrr ≥ 0.5 且 recall_at_5 ≥ 0.5，说明检索阶段基本正常，**不要建议**「增加 top-K」「换检索器」「优化召回」。
+- 若 faithfulness < 0.3 但 recall_at_5 ≥ 0.5，问题在生成端（答案过度展开 / 编造），优先建议「改 system prompt 强制基于证据回答」「降低生成温度」「缩短答案长度」。
+- 若 recall_at_5 ≥ 0.7 但 mrr < 0.4，证据找回了但排在尾部，建议「加 reranker（重排器）」。
+- 若 precision_at_1 高但 precision_at_5 显著下降，说明长尾噪声多，建议**减小** top-K 而非增大。
+- 若 recall_at_5 < 0.4，才说明召回阶段确实有问题，可建议「优化 query 改写」「调 chunk 策略」「加大 top-K」。
 
 评估摘要：
 {json.dumps(summary, ensure_ascii=False)}
@@ -1176,18 +1219,33 @@ def render_section_intro(title: str, description: str) -> None:
     st.markdown(html, unsafe_allow_html=True)
 
 
-def render_kpi_cards(cards: list[tuple[str, str, str]]) -> None:
-    card_html = "".join(
-        (
+def render_kpi_cards(cards: list[tuple]) -> None:
+    """渲染 KPI 卡。每个 card 是 (label, value, note) 或 (label, value, note, tooltip) 4 元组。
+
+    若提供 tooltip，会在 label 末尾追加 ⓘ 字符并通过 HTML title 属性实现原生悬停提示。
+    """
+    items = []
+    for card in cards:
+        if len(card) == 4:
+            label, value, note, tooltip = card
+        else:
+            label, value, note = card
+            tooltip = ""
+        if tooltip:
+            label_html = (
+                f'<div class="rag-kpi-label" title="{ui_escape(tooltip)}">'
+                f'{ui_escape(label)} <span style="opacity:0.55">ⓘ</span></div>'
+            )
+        else:
+            label_html = f'<div class="rag-kpi-label">{ui_escape(label)}</div>'
+        items.append(
             '<div class="rag-kpi">'
-            f'<div class="rag-kpi-label">{ui_escape(label)}</div>'
+            f'{label_html}'
             f'<div class="rag-kpi-value">{ui_escape(value)}</div>'
             f'<div class="rag-kpi-note">{ui_escape(note)}</div>'
             "</div>"
         )
-        for label, value, note in cards
-    )
-    st.markdown(f'<div class="rag-kpi-grid">{card_html}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="rag-kpi-grid">{"".join(items)}</div>', unsafe_allow_html=True)
 
 
 def render_eval_mode_cards(eval_mode: str) -> str:
@@ -1326,12 +1384,43 @@ def render_sidebar_context(project: ProjectContext | None) -> None:
         )
 
 
+DASHBOARD_FORMAT_GUIDE_MD = """\
+**本工具评测什么** — 任意可通过 HTTP 返回答案文本的 RAG 系统，或已跑出结果、只需要离线评测的场景。
+
+**目前已适配的接入方式**
+
+| 方式 | 何时使用 |
+| --- | --- |
+| 通用 JSON API | 自有 RAG 服务，POST/GET 均可，请求与响应字段名通过映射对齐 |
+| Dify | 在「运行测试实验 → 外部 API」内有内置示例与字段说明 |
+| Store API | 字段固定的外部接口，按模板填写即可 |
+| 离线导入历史结果 | CSV / Excel / JSON 文件，按字段映射后直接进入评测 |
+
+**最少需要准备的参数**
+
+- 在线调用：API endpoint、HTTP method、请求 headers（含鉴权）、请求字段映射；响应至少包含 `answer`，建议补 `retrieved_contexts`、`citations`、`latency_ms`、`token_usage`。
+- 离线导入：结果文件至少包含 `question_id`、`question`、`answer`，其余字段按需映射。
+- 测试集自动生成（可选）：LLM 的 API Base、API Key、模型名。
+
+**指标可用性**
+
+- 返回 `retrieved_contexts` 与 `citations` → 全量评测指标。
+- 仅返回 `answer` → 进入 answer-only 模式，仅运行 3 项核心指标。
+"""
+
+
+def render_format_guide(expanded: bool) -> None:
+    with st.expander("支持的 RAG 接入方式与必填参数", expanded=expanded):
+        st.markdown(DASHBOARD_FORMAT_GUIDE_MD)
+
+
 def render_dashboard(project: ProjectContext | None) -> None:
     render_page_header(
         "评测总览",
         "集中查看项目状态、测试集准备度、测试运行进展和下一步动作。",
         None,
     )
+    render_format_guide(expanded=project is None)
     if not project:
         st.info("暂无项目。请先进入“项目设置”创建项目，并补充背景、业务规则和评测目标。")
         render_kpi_cards([
@@ -2464,14 +2553,23 @@ with tab_eval:
             metric_summary = summary.get("metric_summary", {})
             high_risk_count = sum(1 for result in results if result.normalized_score < 0.4)
             render_kpi_cards([
-                ("平均综合得分", str(summary.get("avg_score", 0)), "最近一次评分结果"),
+                (
+                    "平均综合得分", str(summary.get("avg_score", 0)), "最近一次评分结果",
+                    "0-1 区间，越高越好。判读门槛：≥0.8 优秀（可上线）；0.65-0.8 良好（针对低分样本优化）；"
+                    "0.5-0.65 中等（需分析失败标签和检索质量）；0.4-0.5 偏弱（需重点修复）；"
+                    "<0.4 严重（先核对评测数据本身是否合理）。"
+                    "注意：分数受裁判模型、评估模式、样本量影响，跨实验对比时需保持评估配置一致。",
+                ),
                 ("成功率", str(summary.get("success_rate", 0)), "系统输出成功占比"),
                 ("平均延迟(ms)", str(summary.get("avg_latency_ms", 0)), "来自系统响应字段"),
                 ("高风险样本", str(high_risk_count), "综合得分低于 0.4"),
             ])
 
+            _rank_names_set = set(rank_metric_names())
             metric_rows = []
             for name, value in metric_summary.items():
+                if name in _rank_names_set:
+                    continue  # rank-aware 检索指标在下方「常规 RAG 检索指标」单独展示
                 label, desc = METRIC_USER_INFO.get(name, (name, ""))
                 is_risk = name == "hallucination_risk"
                 if is_risk:
@@ -2489,6 +2587,62 @@ with tab_eval:
                         "分数": st.column_config.ProgressColumn("分数", min_value=0, max_value=1, format="%.3f"),
                     },
                 )
+
+            # ── 常规 RAG 检索指标（rank-aware） ─────────────────────────────
+            rank_present = {n: metric_summary[n] for n in rank_metric_names() if n in metric_summary}
+            if rank_present:
+                st.subheader("常规 RAG 检索指标")
+                st.caption(
+                    "主流 IR / RAG 评测的秩序感知指标。与上方「指标概览」中的集合级 hit_rate / "
+                    "context_precision 互补——这里关心**证据排在第几位**，前者只关心**有没有命中**。"
+                    "仅当样本同时具备 expected_evidence 和检索上下文时计算。"
+                )
+                rank_table_rows = []
+                for name in rank_metric_names():
+                    if name not in rank_present:
+                        continue
+                    label, help_text = RANK_METRIC_TOOLTIPS.get(name, (name, ""))
+                    rank_table_rows.append({
+                        "指标": label,
+                        "分数": round(rank_present[name], 4),
+                        "含义": help_text,
+                    })
+                rank_df = pd.DataFrame(rank_table_rows)
+                _show_df(
+                    rank_df,
+                    column_config={
+                        "指标": st.column_config.TextColumn(
+                            "指标 ⓘ",
+                            help="鼠标悬停「含义」列可查看详细解释，或参考下方折线图。",
+                        ),
+                        "分数": st.column_config.ProgressColumn(
+                            "分数", min_value=0, max_value=1, format="%.4f",
+                        ),
+                        "含义": st.column_config.TextColumn(
+                            "含义",
+                            help="MRR 单值；Recall@k 关注「前 k 条里有没有相关证据」；"
+                                 "Precision@k 关注「前 k 条里相关比例多少」。",
+                            width="large",
+                        ),
+                    },
+                )
+
+                # 折线图：Recall@k 收敛速度 vs Precision@k 衰减速度
+                ks = sorted(RANK_KS)
+                chart_rows = []
+                for k in ks:
+                    chart_rows.append({
+                        "k": k,
+                        "Recall@k": rank_present.get(f"recall_at_{k}", 0),
+                        "Precision@k": rank_present.get(f"precision_at_{k}", 0),
+                    })
+                chart_df = pd.DataFrame(chart_rows).set_index("k")
+                st.caption(
+                    "**top-k 趋势图**：Recall@k 越快接近 1.0、Precision@k 衰减越慢，检索质量越好。"
+                    "Recall@5 已经接近 1 但 Recall@1 偏低 → 证据散在尾部，需重排；"
+                    "Precision@5 远低于 Precision@1 → top-k 长尾有大量噪声 chunk。"
+                )
+                st.line_chart(chart_df, height=240)
 
             # ── 深度分析 ──────────────────────────────────────────────────
             st.subheader("深度分析")
@@ -2659,6 +2813,226 @@ with tab_eval:
                     store.update_eval_failure_labels(row["result_id"], labels)
                 st.success("失败标签已更新。")
                 st.rerun()
+
+            with st.expander("人工抽检（LLM 裁判 / 评估器对齐校验）"):
+                st.markdown(
+                    "**本模块含义**：当前评估器（LLM 裁判 / RAGAS / 嵌入 / 规则）的打分是否与人类判断一致？"
+                    "没有人工对齐数据，评分结论缺乏可信度。本模块通过对**已有评分**抽样人工标注，"
+                    "计算 Spearman ρ、Cohen's κ、Pearson r 三个对齐指标，回答「评估器是否值得信任」。"
+                )
+                st.markdown(
+                    "**使用方式**：\n"
+                    "1. 在上方先完成评估（任意模式；LLM 裁判最值得验证，规则评分意义有限）。\n"
+                    "2. 设置抽样数 N，点「生成抽检模板」下载 CSV（包含问题、答案、检索上下文，**不含评分**——双盲）。\n"
+                    "3. 在 Excel 中填 `human_overall_score` 列（1=完全错 / 5=完美），不要修改 question_id。\n"
+                    "4. 上传回填后的 CSV，自动算出 ρ / κ / r 三个对齐指标。"
+                )
+                st.markdown(
+                    "**关于 N 的选择**："
+                    "评分样本 ≥ 30 时默认 N=30 即可（推荐下限），50 更稳、100 边际收益低；"
+                    "评分样本 < 30 时建议 N = 全部样本，样本越少 ρ / κ 波动越大，结论仅供方向参考。"
+                )
+
+                with st.popover("FAQ 为什么抽 30 条就能验证 1000 条 LLM 判断？"):
+                    st.markdown(
+                        "**注意**：抽 30 条标注**不是为了核查这 30 条**，"
+                        "而是为了**估计一个分布参数**——「裁判与人类判断的总体相关性 ρ_true」。"
+                        "前者只能覆盖 30 条，后者可以从小样本无偏地外推到全部。\n\n"
+                        "**民调类比**：盖洛普用 1500 人预测 1.4 亿选民偏好，误差 ±3%。"
+                        "结论的不确定性主要取决于**样本量本身**，几乎不取决于总体大小"
+                        "（finite population correction，N≪population 时几乎为 1）。\n\n"
+                        "**数学背书**：n=30 时 Spearman ρ 的标准误约 `1/√(n-3) ≈ 0.19`。"
+                        "若真实 ρ=0.7，估计值大概率落在 [0.51, 0.89]——"
+                        "足够区分「高度一致 vs 完全不一致」，不够区分 0.70 vs 0.75，"
+                        "但元评估只需要前者级别的判断。\n\n"
+                        "**关键前提**（不满足则结论不能外推）：\n"
+                        "1. 抽样真随机（不能挑容易的题）\n"
+                        "2. 抽样集合与剩余样本**同分布**——同一题型、难度、RAG 系统版本\n\n"
+                        "**总之简单理解**：厨师试菜不用喝完整锅汤；体检抽 5 mL 血就能反映全身 5 L 血的指标。"
+                        "当然前提是这一勺是**搅匀后**舀出来的（保证随机性）。\n\n"
+                        "Spearman: 可以判断judge和人工排名有一定相关性,但不能说judge与人工判断对齐\n\n" 
+                        "Pearson: 可以判断分数数值有中等线性关系,但不能说绝对分数完全可信\n\n" 
+                        "Cohen's κ: 分类判断有一定一致性,但不能说judge在好中差判断上可靠\n\n"
+
+                    )
+
+                judge_models_in_run = {r.judge_model for r in results if r.judge_model}
+                if judge_models_in_run == {"rule-based-mvp"}:
+                    st.info(
+                        "当前实验使用规则评分（字符 Jaccard），评分本身确定性较高，元评估意义有限。"
+                        "建议在 LLM 裁判 / RAGAS / 嵌入相似度模式下进行人工对齐。"
+                    )
+                base_dir = config.db_path.parent
+                existing = load_meta_eval(run.run_id, base_dir)
+
+                current_score_versions = {r.score_version for r in results if r.score_version}
+                if existing:
+                    saved_v = existing.get("score_version")
+                    if saved_v and current_score_versions and saved_v not in current_score_versions:
+                        st.warning(
+                            f"评分版本已变更：保存时 score_version={saved_v}，"
+                            f"当前实验为 {sorted(current_score_versions)}。建议重新抽样后再做对齐。"
+                        )
+                    align = existing.get("alignment", {})
+                    align_rows = [{
+                        "配对样本数": align.get("n_pairs", 0),
+                        "Spearman ρ": align.get("spearman_rho"),
+                        "Spearman p": align.get("spearman_p"),
+                        "Pearson r": align.get("pearson_r"),
+                        "Pearson p": align.get("pearson_p"),
+                        "Cohen's κ": align.get("kappa_quadratic"),
+                        "评分版本": saved_v or "—",
+                        "计算时间": align.get("computed_at", "—"),
+                    }]
+                    align_column_config = {
+                        "配对样本数": st.column_config.NumberColumn(
+                            "配对样本数 ⓘ",
+                            help="实际参与对齐计算的样本数（导出 N 减去人工漏填或填错的样本）。业界推荐通常要求 ≥30。",
+                        ),
+                        "Spearman ρ": st.column_config.NumberColumn(
+                            "Spearman ρ ⓘ",
+                            help="秩相关系数，−1 到 1。0.7 以上为强相关、0.4–0.7 中等、<0.4 弱。对评分类（序数）数据比 Pearson 更稳健。",
+                            format="%+.4f",
+                        ),
+                        "Spearman p": st.column_config.NumberColumn(
+                            "Spearman p ⓘ",
+                            help="Spearman 双侧检验 p 值。p<0.05 表示秩相关在统计上显著（不是 0）。",
+                            format="%.4f",
+                        ),
+                        "Pearson r": st.column_config.NumberColumn(
+                            "Pearson r ⓘ",
+                            help="线性相关系数。Pearson r 与 Spearman ρ 接近 → 关系近似线性；差距大 → 关系单调但非线性。",
+                            format="%+.4f",
+                        ),
+                        "Pearson p": st.column_config.NumberColumn(
+                            "Pearson p ⓘ",
+                            help="Pearson 双侧检验 p 值。",
+                            format="%.4f",
+                        ),
+                        "Cohen's κ": st.column_config.NumberColumn(
+                            "Cohen's κ ⓘ",
+                            help="二次加权 κ（0-1 评分按 0.2 等距分桶为 1-5 后与人工 1-5 比较）。"
+                                 "0.81+ almost perfect、0.61–0.80 substantial、0.41–0.60 moderate、<0.40 fair-poor。",
+                            format="%+.4f",
+                        ),
+                        "评分版本": st.column_config.TextColumn(
+                            "评分版本 ⓘ",
+                            help="抽样时 EvalResult.score_version。若与当前不一致，说明实验已被重评，建议重新抽样。",
+                        ),
+                        "计算时间": st.column_config.TextColumn(
+                            "计算时间 ⓘ",
+                            help="本次对齐结果的生成时间。",
+                        ),
+                    }
+                    _show_df(pd.DataFrame(align_rows), column_config=align_column_config)
+                    st.caption(
+                        "建议判读门槛：Spearman ρ ≥ 0.6 且 Cohen's κ ≥ 0.5，方可在汇报中称"
+                        "「评估器与人工判断对齐」。低于门槛说明评估器需要调整 prompt、温度或换更强模型。"
+                    )
+
+                responses_by_id = {r.response_id: r for r in responses}
+                available_count = sum(
+                    1 for r in results
+                    if getattr(r, "evaluation_status", "") != "judge_failed"
+                    and (responses_by_id.get(r.response_id) and responses_by_id[r.response_id].success)
+                )
+                st.caption(
+                    f"当前实验可用于抽检的有效评分样本：**{available_count}** 条"
+                    f"（已自动排除评估器报错和系统调用失败的样本）。"
+                )
+                n_max = max(1, min(100, available_count))
+                n_default = min(30, n_max)
+                col_n, col_seed, col_btn = st.columns([1, 1, 1.4])
+                with col_n:
+                    meta_n = st.number_input(
+                        "抽样数 N", min_value=1, max_value=n_max,
+                        value=n_default, step=1, key=f"meta_eval_n_{run.run_id}",
+                    )
+                with col_seed:
+                    seed_text = st.text_input(
+                        "随机种子（可选）", value="", key=f"meta_eval_seed_{run.run_id}",
+                        help="留空则每次结果不同。填写整数可复现同一抽样。",
+                    )
+                seed_value: int | None
+                if seed_text.strip():
+                    try:
+                        seed_value = int(seed_text)
+                    except ValueError:
+                        st.error("种子必须为整数")
+                        seed_value = None
+                else:
+                    seed_value = None
+
+                with col_btn:
+                    if st.button("生成抽检模板", key=f"meta_eval_sample_{run.run_id}"):
+                        df_template = sample_for_review(
+                            results=results,
+                            responses=responses,
+                            samples_by_id=samples_by_id,
+                            n=int(meta_n),
+                            seed=seed_value,
+                        )
+                        if df_template.empty:
+                            st.error("没有可用的成功评分样本（已排除失败 / 评估器报错的条目）。")
+                        else:
+                            st.session_state[f"meta_eval_qids_{run.run_id}"] = df_template["question_id"].tolist()
+                            csv_bytes = export_template_csv(df_template)
+                            st.download_button(
+                                "下载抽检 CSV 模板",
+                                data=csv_bytes,
+                                file_name=f"meta_eval_{run.run_id}_n{len(df_template)}.csv",
+                                mime="text/csv",
+                                key=f"meta_eval_download_{run.run_id}",
+                            )
+                            st.success(f"已抽样 {len(df_template)} 条，请下载 CSV 后离线打分。")
+
+                st.markdown(
+                    "**评分标准**：1=完全错误 / 2=部分错误 / 3=可接受但有问题 / 4=正确但不完美 / 5=完美。"
+                    "`human_overall_score` 人工评分列填整数 1-5，留空表示弃权；`human_notes` 备忘笔记可选。"
+                    "**请勿修改 question_id 列!**。"
+                )
+
+                uploaded = st.file_uploader(
+                    "上传回填后的 CSV", type=["csv"], key=f"meta_eval_upload_{run.run_id}",
+                )
+                if uploaded is not None and st.button(
+                    "提交并计算对齐", key=f"meta_eval_submit_{run.run_id}", type="primary",
+                ):
+                    expected_qids = st.session_state.get(
+                        f"meta_eval_qids_{run.run_id}",
+                        existing.get("sampled_qids", []) if existing else [],
+                    )
+                    if not expected_qids:
+                        expected_qids = [r.question_id for r in results]
+                    annotations, warnings = import_annotations(uploaded.getvalue(), expected_qids)
+                    for w in warnings:
+                        st.warning(w)
+                    if not annotations:
+                        st.error("未解析到任何有效评分。")
+                    else:
+                        human = {qid: a["score"] for qid, a in annotations.items()}
+                        judge = {r.question_id: r.normalized_score for r in results}
+                        alignment = compute_alignment(human, judge)
+                        first = next(iter(annotations))
+                        ref_result = next((r for r in results if r.question_id == first), None)
+                        payload = {
+                            "run_id": run.run_id,
+                            "score_version": ref_result.score_version if ref_result else "",
+                            "judge_model": ref_result.judge_model if ref_result else "",
+                            "evaluator_mode": run.config.get("eval_mode", "") if isinstance(run.config, dict) else "",
+                            "n_requested": int(meta_n),
+                            "seed": seed_value,
+                            "sampled_qids": list(expected_qids),
+                            "annotations": annotations,
+                            "alignment": alignment,
+                        }
+                        save_meta_eval(run.run_id, payload, base_dir)
+                        st.success(
+                            f"已保存 {len(annotations)} 条人工评分。"
+                            f"Spearman ρ={alignment.get('spearman_rho')}，"
+                            f"Cohen's κ={alignment.get('kappa_quadratic')}。"
+                        )
+                        st.rerun()
         elif responses:
             st.subheader("尚未评分的 RAG 回答")
             preview_df = response_review_dataframe(responses, samples)
@@ -2679,14 +3053,119 @@ with tab_compare:
         options = {f"{r.name} ({r.run_id})": r.run_id for r in runs}
         selected = st.multiselect("选择至少两个实验", list(options.keys()), default=list(options.keys())[:2])
         summaries = []
+        score_maps: list[dict[str, float]] = []
         for label in selected:
             run = store.get_experiment(options[label])
             responses = store.list_system_responses(run.run_id)
             results = store.list_eval_results(run.run_id)
             summaries.append(summarize_run(run, responses, results))
+            score_maps.append({r.question_id: r.normalized_score for r in results})
         if summaries:
             compare_df = comparison_dataframe(summaries)
             _show_df(compare_df, hide_index=False)
+
+            render_section_intro(
+                "统计显著性",
+                "基于每条样本的归一化总分，给出每个实验的均值与 95% 置信区间。"
+                "选中两个实验时，额外给出配对差异检验，判断分数差是真实改进还是抽样噪声。",
+            )
+            ci_rows = []
+            for summary, score_map in zip(summaries, score_maps):
+                values = list(score_map.values())
+                lo, hi = bootstrap_ci(values) if values else (0.0, 0.0)
+                ci_rows.append({
+                    "实验名称": summary["name"],
+                    "样本数": len(values),
+                    "平均总分": round(sum(values) / len(values), 4) if values else 0.0,
+                    "95% CI 下界": round(lo, 4),
+                    "95% CI 上界": round(hi, 4),
+                })
+            ci_column_config = {
+                "实验名称": st.column_config.TextColumn(
+                    "实验名称 ⓘ",
+                    help="参与本次对比的实验运行。",
+                ),
+                "样本数": st.column_config.NumberColumn(
+                    "样本数 ⓘ",
+                    help="该实验中参与统计的有效评分样本数（已生成 EvalResult 的样本）。",
+                ),
+                "平均总分": st.column_config.NumberColumn(
+                    "平均总分 ⓘ",
+                    help="每条样本归一化总分（0-1）的算术平均；幻觉风险已反向计入。值越高表示该实验整体表现越好。",
+                    format="%.4f",
+                ),
+                "95% CI 下界": st.column_config.NumberColumn(
+                    "95% CI 下界 ⓘ",
+                    help="对样本得分做 1000 次 bootstrap 重采样后，得到均值分布的 2.5% 分位数。可粗略理解为：以 95% 信心估计，真实均值不低于该值。",
+                    format="%.4f",
+                ),
+                "95% CI 上界": st.column_config.NumberColumn(
+                    "95% CI 上界 ⓘ",
+                    help="bootstrap 均值分布的 97.5% 分位数。与下界共同界定真实均值的合理范围；区间越窄说明评分越稳定，区间越宽通常意味着样本量不足或评分波动大。",
+                    format="%.4f",
+                ),
+            }
+            _show_df(pd.DataFrame(ci_rows), column_config=ci_column_config)
+
+            if len(score_maps) == 2:
+                a_name, b_name = summaries[0]["name"], summaries[1]["name"]
+                paired = paired_diff_stats(score_maps[0], score_maps[1])
+                if paired is None:
+                    st.caption("两实验缺少共同的 question_id，无法做配对检验。")
+                else:
+                    significant = paired["p_value"] < 0.05
+                    diff_rows = [{
+                        "对比方向": f"{b_name}  −  {a_name}",
+                        "差异": round(paired["mean_diff"], 4),
+                        "差异 95% CI 下界": round(paired["ci_low"], 4),
+                        "差异 95% CI 上界": round(paired["ci_high"], 4),
+                        "配对样本数": paired["n_pairs"],
+                        "Wilcoxon p": round(paired["p_value"], 4),
+                        "Cohen's d": round(paired["cohens_d"], 3),
+                        "结论": "差异显著" if significant else "未达显著水平",
+                    }]
+                    diff_column_config = {
+                        "对比方向": st.column_config.TextColumn(
+                            "对比方向 ⓘ",
+                            help="左侧实验减去右侧实验的得分；正值代表左侧更好，负值代表右侧更好。",
+                        ),
+                        "差异": st.column_config.NumberColumn(
+                            "差异 ⓘ",
+                            help="两实验在共同样本上的平均总分差值。仅看绝对大小不够，应结合下方 CI、p 值和效应量综合判断。",
+                            format="%+.4f",
+                        ),
+                        "差异 95% CI 下界": st.column_config.NumberColumn(
+                            "差异 95% CI 下界 ⓘ",
+                            help="对配对差值做 1000 次 bootstrap 重采样后，差值均值分布的 2.5% 分位数。",
+                            format="%+.4f",
+                        ),
+                        "差异 95% CI 上界": st.column_config.NumberColumn(
+                            "差异 95% CI 上界 ⓘ",
+                            help="差值均值分布的 97.5% 分位数。若 CI 跨越 0（下界为负、上界为正），说明在 95% 信心下无法排除「差异为零」，结论不稳。",
+                            format="%+.4f",
+                        ),
+                        "配对样本数": st.column_config.NumberColumn(
+                            "配对样本数 ⓘ",
+                            help="两实验共同拥有的 question_id 数量。只有共同样本才参与配对检验，避免因样本不一致带来的偏差。",
+                        ),
+                        "Wilcoxon p": st.column_config.NumberColumn(
+                            "Wilcoxon p ⓘ",
+                            help="Wilcoxon signed-rank 双侧检验的 p 值。p<0.05 通常视为差异在统计上显著。该检验不要求数据服从正态分布，对评分类指标更稳健。",
+                            format="%.4f",
+                        ),
+                        "Cohen's d": st.column_config.NumberColumn(
+                            "Cohen's d ⓘ",
+                            help="效应量 = 差值均值 ÷ 差值标准差。|d| ≈ 0.2 视为小效应、0.5 中等、0.8 大效应。用于回答「差异在统计上显著之外，实际意义有多大」。",
+                            format="%+.3f",
+                        ),
+                        "结论": st.column_config.TextColumn(
+                            "结论 ⓘ",
+                            help="依据 Wilcoxon p 值的简短判定。显著并不必然意味着差异在业务上重要，请结合 Cohen's d 和 CI 一起看。",
+                        ),
+                    }
+                    _show_df(pd.DataFrame(diff_rows), column_config=diff_column_config)
+                st.caption("提示：将鼠标悬停在带 ⓘ 的列名上，可查看每个指标的详细解释。")
+
             render_section_intro("质量对比", "横向条形图更适合中文实验名称，便于快速比较平均总分和成功率。")
             _show_grouped_horizontal_bar_chart(compare_df, category="实验名称", value_columns=["平均总分", "成功率"])
             render_section_intro("成本与性能对比", "平均延迟和估算成本量纲不同，建议分别关注排序和异常值。")

@@ -40,3 +40,5 @@ tools/
 # Local Claude Code settings
 .claude/settings.local.json
 ReportSummry_Project.docx
+/.claude
+app/DEVELOPMENT_LOG.md
