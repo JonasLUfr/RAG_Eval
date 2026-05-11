@@ -194,6 +194,7 @@ expected_evidence, tags, source_context_refs。
 - difficulty 只能是 “低”、“中”、“高”。
 - tags 是字符串数组。
 - source_context_refs 是字符串数组，指向项目背景、上传文件名、业务规则或高级材料。
+- expected_evidence 必须是单个字符串（不是数组）；如有多条证据，用换行符 \n 拼接。
 - 如果材料不足，请生成考察拒答能力的问题，而不是编造事实。
 """
 
