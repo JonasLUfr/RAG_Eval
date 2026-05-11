@@ -1481,8 +1481,9 @@ def render_dashboard(project: ProjectContext | None) -> None:
                     "运行名称": run.name,
                     "模式": run.mode,
                     "样本数": summary.get("samples", 0),
-                    "平均总分": summary.get("avg_score", 0) if results else "未评分",
-                    "成功率": summary.get("success_rate", 0) if responses else "暂无",
+                    # 同列保持统一类型避免 pyarrow 序列化报错：评分/未评分都转 str 展示
+                    "平均总分": f"{summary.get('avg_score', 0):.4f}" if results else "未评分",
+                    "成功率": f"{summary.get('success_rate', 0):.2%}" if responses else "暂无",
                     "平均延迟(ms)": summary.get("avg_latency_ms", 0),
                 }
             )
