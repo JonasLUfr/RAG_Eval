@@ -10,6 +10,7 @@ _REPO_ROOT = _THIS_FILE.parent.parent  # app/ 的父目录
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+import dataclasses
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -2428,6 +2429,34 @@ with tab_eval:
                 _eval_max_contexts = int(_max_ctx_input)
                 _eval_context_max_chars = int(_max_chars_input)
 
+        with st.expander("性能与并发（可选，加速评估 / 控制超时）", expanded=False):
+            st.caption(
+                "并发数提高 → 总耗时变短，但要求 LLM endpoint 撑得住对应 QPS。"
+                "单次超时调小 → 卡死请求更快放弃。重试次数调小 → 单条最坏耗时降低。"
+            )
+            _perf_c1, _perf_c2, _perf_c3 = st.columns(3)
+            with _perf_c1:
+                _max_workers_input = st.number_input(
+                    "并发数", min_value=1, max_value=50,
+                    value=config.max_workers, step=1, key="eval_max_workers",
+                    help="同时进行的评估请求数。LLM 端点限速时调小；OpenAI 类一般 15-25 安全。embedding 模式强制为 1。",
+                )
+            with _perf_c2:
+                _timeout_input = st.number_input(
+                    "单次超时（秒）", min_value=10, max_value=600,
+                    value=config.request_timeout_seconds, step=5, key="eval_timeout",
+                    help="单条 LLM 调用上限。卡死时此值越小越快失败。建议 30-60。",
+                )
+            with _perf_c3:
+                _retry_input = st.number_input(
+                    "重试次数", min_value=0, max_value=5,
+                    value=config.retry_times, step=1, key="eval_retry",
+                    help="单条失败后的额外重试次数。0=不重试，最坏耗时 = 超时×1；2=最坏耗时 = 超时×3。",
+                )
+        _max_workers_eval = int(_max_workers_input)
+        _timeout_eval = int(_timeout_input)
+        _retry_eval = int(_retry_input)
+
         _calls_per_sample = {"rule": 0, "embedding": 0, "llm_judge": 1, "ragas": 8}.get(eval_mode, 0)
         _planned_samples = min(len(responses), config.default_max_eval_questions)
         _planned_calls = _calls_per_sample * _planned_samples
@@ -2458,20 +2487,12 @@ with tab_eval:
                 )
                 _ok = False
             if _ok:
-                # 评估方式校验通过即视为「这套配置确实在用」，写回最近预设（不含 Key）
                 if eval_mode == "ragas":
-                    save_preset("eval_ragas", {
-                        "api_base": _ragas_base,
-                        "model": _ragas_model,
-                    })
+                    save_preset("eval_ragas", {"api_base": _ragas_base, "model": _ragas_model})
                 elif eval_mode == "llm_judge":
-                    save_preset("eval_llm_judge", {
-                        "api_base": _ragas_base,
-                        "model": _ragas_model,
-                    })
+                    save_preset("eval_llm_judge", {"api_base": _ragas_base, "model": _ragas_model})
                 limited = responses[: config.default_max_eval_questions]
 
-                # 嵌入模式：首次需要下载模型（~470MB），在进度条启动前显式预加载
                 if eval_mode == "embedding" and eval_embedding_model:
                     with st.spinner(
                         f"正在加载嵌入模型 {eval_embedding_model}……"
@@ -2487,6 +2508,14 @@ with tab_eval:
 
             if _ok:
                 limited = responses[: config.default_max_eval_questions]
+                # 用户在 UI 上调的性能参数通过 dataclasses.replace 注入到本次 config 副本，
+                # AppConfig 是 frozen dataclass，必须用 replace 不能直接赋值。
+                run_config = dataclasses.replace(
+                    config,
+                    max_workers=_max_workers_eval,
+                    request_timeout_seconds=_timeout_eval,
+                    retry_times=_retry_eval,
+                )
                 progress_bar = st.progress(0)
                 status = st.empty()
 
@@ -2495,7 +2524,7 @@ with tab_eval:
                     status.write(f"已评分 {progress.completed}/{progress.total}，失败 {progress.failed}")
 
                 engine = EvaluationEngine(
-                    config,
+                    run_config,
                     eval_mode=eval_mode,
                     embedding_model=eval_embedding_model,
                     ragas_api_base=_ragas_base or None,
@@ -2511,9 +2540,9 @@ with tab_eval:
                 combo_findings = metric_combo_findings(summary.get("metric_summary", {}))
                 summary["metric_combo_findings"] = combo_findings
                 if eval_mode == "ragas":
-                    _base = _ragas_base or config.llm_api_base
-                    _key = _ragas_key or config.llm_api_key
-                    _model = _ragas_model or config.llm_model
+                    _base = _ragas_base or run_config.llm_api_base
+                    _key = _ragas_key or run_config.llm_api_key
+                    _model = _ragas_model or run_config.llm_model
                     summary["llm_guidance"] = generate_llm_guidance(
                         summary,
                         combo_findings,
@@ -2524,7 +2553,7 @@ with tab_eval:
                 else:
                     summary["llm_guidance"] = ""
                 run.aggregate = summary
-                run.config["score_version"] = config.score_version
+                run.config["score_version"] = run_config.score_version
                 run.config["eval_mode"] = eval_mode
                 store.save_experiment(run)
                 st.success(f"评估完成，保存 {len(results)} 条评分结果。")

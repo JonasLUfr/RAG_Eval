@@ -42,3 +42,8 @@ tools/
 ReportSummry_Project.docx
 /.claude
 app/DEVELOPMENT_LOG.md
+
+# Project review (local only, not for repo)
+PROJECT_REVIEW.md
+PROJECT_REVIEW.html
+_build_review_html.py
