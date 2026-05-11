@@ -85,6 +85,11 @@ class EvalSample:
             data["source_context_refs"] = [
                 x.strip() for x in data["source_context_refs"].split(",") if x.strip()
             ]
+        # LLM 生成或 JSON 导入时 expected_evidence 偶尔会以 list 形式给出，
+        # 但 schema 与下游 (.strip()/Jaccard) 都按 str 处理，这里统一归一化。
+        ev = data.get("expected_evidence")
+        if isinstance(ev, list):
+            data["expected_evidence"] = "\n".join(str(x).strip() for x in ev if str(x).strip())
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
