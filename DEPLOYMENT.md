@@ -115,6 +115,48 @@ tail -f app/data/logs/app.log
 
 ---
 
+## 故障排查（网站突然不可访问）
+
+应用在每次启动 / 退出 / 抛异常时都会在 `app/data/logs/app.log` 写明显标记，看末尾几行即可判定死因。
+
+### 1. 翻日志
+
+```bash
+# 应用日志末尾（最先看这个）
+tail -200 /workspace/web/rag-eval/app/data/logs/app.log
+
+# systemd 视角：进程退出码、被哪个信号杀的、重启次数
+systemctl status <service-name>
+journalctl -u <service-name> --since "10 minutes ago" --no-pager
+
+# 内存压力（OOM 嫌疑时）
+dmesg | grep -i "killed process\|out of memory" | tail -20
+
+# 端口是否真的还在监听
+ss -tlnp | grep 8501
+```
+
+### 2. 死因判定速查表
+
+看 `app.log` **最后几行**：
+
+| 末尾标记 | 推断 | 处理 |
+| --- | --- | --- |
+| `=== shutdown signal=SIGTERM ===` 或 `SIGINT` | systemd / 人为重启，正常退出 | 看启动 banner 确认是否已重启回来 |
+| `=== UNCAUGHT EXCEPTION ===` + traceback | 代码抛了未捕获异常导致进程死 | 按 traceback 修 bug |
+| 普通业务日志，**没有任何 shutdown / exception 标记** | 大概率被 SIGKILL（OOM 杀手 / kernel） | 查 `dmesg` 找内存证据；若确认 OOM，加内存或减小 `RAG_EVAL_MAX_WORKERS` |
+| 完全为空 / 极旧 | 进程根本没起来 | `systemctl status` 看启动失败原因 |
+
+每次进程启动会写一行 `=== STARTUP pid=X py=... ===`，多次重启之间的边界一目了然。
+
+### 3. 还原现场速查
+
+- 「之前能用，突然不能用」→ 先 `tail app.log` 看死因；再 `journalctl ... --since` 看 systemd 是否在重启循环
+- 「重启后能用一阵又挂」→ 多半 OOM 或 文件句柄泄漏，`dmesg` + `ls /proc/<pid>/fd | wc -l` 验证
+- 「页面能进但具体操作报错」→ 不是宕机，是单次脚本异常，红框 traceback 就在浏览器里，对照 `app.log` 即可
+
+---
+
 ## 升级
 
 ```bash

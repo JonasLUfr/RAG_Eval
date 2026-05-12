@@ -28,9 +28,31 @@ docker compose up -d --build
 
 ⚠️ 部署用 `requirements.lock.txt`（精确锁定版本），如开发可继续用 `requirements.txt`。
 
+## 运维与故障排查
+
+进程每次启动 / 退出 / 抛异常都会在 `app/data/logs/app.log` 写入显眼标记，**网站突然挂掉时查看末尾几行即可判定死因**：
+
+| 末尾标记 | 含义 |
+| --- | --- |
+| `=== STARTUP pid=X py=... ===` | 进程刚启动 |
+| `=== shutdown signal=SIGTERM ===` | systemd / 人为重启，正常退出 |
+| `=== UNCAUGHT EXCEPTION ===` + traceback | 代码异常导致崩溃，按 traceback 修 |
+| 上述都没有 | 大概率被 SIGKILL（OOM / kernel），查 `dmesg` |
+
+```bash
+# 应用日志（含上面的诊断标记）
+tail -200 app/data/logs/app.log
+
+# systemd 视角
+systemctl status <service-name>
+journalctl -u <service-name> --since "10 minutes ago"
+```
+
+完整命令清单和死因判定表见 [DEPLOYMENT.md 故障排查章节](DEPLOYMENT.md#故障排查网站突然不可访问)。
+
 ## 其他文档
 
-- [DEPLOYMENT.md](DEPLOYMENT.md) — 服务器部署指南
+- [DEPLOYMENT.md](DEPLOYMENT.md) — 服务器部署指南 + 故障排查
 - [app/USER_GUIDE.md](app/USER_GUIDE.md) — 用户操作指南
 - [app/DEVELOPMENT_LOG.md](app/DEVELOPMENT_LOG.md) — 开发日志
 
