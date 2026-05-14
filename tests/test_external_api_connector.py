@@ -75,3 +75,22 @@ def test_api_timeout_retries_then_fails(monkeypatch):
     assert "slow" in response.error
     assert response.raw_response["_attempts"] == 3
     assert len(calls) == 3
+
+
+def test_api_accepts_usage_dict_for_token_usage(monkeypatch):
+    def fake_post(*_args, **_kwargs):
+        return FakeResponse(200, {"answer": "ok", "usage": {"total_tokens": 17}})
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    connector = ExternalAPIConnector(
+        AppConfig(request_timeout_seconds=1, retry_times=0),
+        ConnectorConfig(
+            endpoint="https://example.test/query",
+            response_mapping={"answer": "answer", "token_usage": "usage"},
+        ),
+    )
+
+    response = connector.run_one(_sample())
+
+    assert response.success is True
+    assert response.token_usage == 17

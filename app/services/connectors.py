@@ -166,8 +166,8 @@ class ExternalAPIConnector:
             answer=str(answer or ""),
             retrieved_contexts=contexts,
             citations=citations,
-            latency_ms=float(mapped_latency or latency_ms),
-            token_usage=int(token_usage) if token_usage not in (None, "") else None,
+            latency_ms=self._as_float(mapped_latency, latency_ms),
+            token_usage=self._as_token_usage(token_usage),
             raw_response=raw,
             success=True,
         )
@@ -191,3 +191,26 @@ class ExternalAPIConnector:
         if isinstance(value, list):
             return [str(x) for x in value]
         return [str(value)]
+
+    @staticmethod
+    def _as_float(value: Any, default: float) -> float:
+        try:
+            if value in (None, ""):
+                return float(default)
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    @staticmethod
+    def _as_token_usage(value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, dict):
+            for key in ("total_tokens", "totalTokens", "tokens", "total"):
+                if key in value:
+                    return ExternalAPIConnector._as_token_usage(value[key])
+            return None
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None

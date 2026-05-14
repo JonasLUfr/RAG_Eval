@@ -296,6 +296,20 @@ class SQLiteStore:
             conn.execute("DELETE FROM system_responses WHERE run_id=?", (run_id,))
             conn.execute("DELETE FROM experiments WHERE run_id=?", (run_id,))
 
+    def delete_project(self, project_id: str) -> None:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT run_id FROM experiments WHERE project_id=?",
+                (project_id,),
+            ).fetchall()
+            for row in rows:
+                run_id = row["run_id"]
+                conn.execute("DELETE FROM eval_results WHERE run_id=?", (run_id,))
+                conn.execute("DELETE FROM system_responses WHERE run_id=?", (run_id,))
+            conn.execute("DELETE FROM experiments WHERE project_id=?", (project_id,))
+            conn.execute("DELETE FROM test_cases WHERE project_id=?", (project_id,))
+            conn.execute("DELETE FROM project_contexts WHERE project_id=?", (project_id,))
+
     def update_eval_failure_labels(self, result_id: str, labels: list[str]) -> None:
         with self.connect() as conn:
             row = conn.execute(
@@ -313,4 +327,3 @@ class SQLiteStore:
                 """,
                 (self._json(labels), self._json(data), result_id),
             )
-

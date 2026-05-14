@@ -370,7 +370,7 @@ def overall_judge_summary(summary: dict, results: list) -> str:
     )
 
 
-def offer_dataframe_download(df: pd.DataFrame, file_prefix: str) -> None:
+def offer_dataframe_download(df: pd.DataFrame, file_prefix: str, key: str) -> None:
     if df.empty:
         return
     csv_data = df.to_csv(index=False).encode("utf-8-sig")
@@ -379,6 +379,7 @@ def offer_dataframe_download(df: pd.DataFrame, file_prefix: str) -> None:
         data=csv_data,
         file_name=f"{file_prefix}.csv",
         mime="text/csv",
+        key=key,
     )
 
 
@@ -1494,6 +1495,25 @@ def render_dashboard(project: ProjectContext | None) -> None:
         st.info("暂无运行记录。完成测试用例审核后，可在“运行测试”中导入历史结果或调用外部 RAG API。")
 
 
+    with st.expander("危险操作", expanded=False):
+        st.warning(
+            "删除当前项目会同时删除项目设置、测试问题、运行记录、API 响应和评分结果。此操作不可撤销。"
+        )
+        confirm_delete_project = st.checkbox(
+            f"确认删除项目：{project.name}",
+            key=f"confirm_delete_project_{project.project_id}",
+        )
+        if st.button(
+            "删除当前项目",
+            type="primary",
+            disabled=not confirm_delete_project,
+            key=f"delete_project_{project.project_id}",
+        ):
+            store.delete_project(project.project_id)
+            st.success("项目已删除。")
+            st.rerun()
+
+
 def current_project_selector() -> ProjectContext | None:
     projects = store.list_project_contexts()
     if not projects:
@@ -2052,7 +2072,7 @@ with tab_experiment:
                     )
                     st.subheader("本次导入的 RAG 回答预览")
                     _show_df(preview_df)
-                    offer_dataframe_download(preview_df, f"{run.name}_rag_responses")
+                    offer_dataframe_download(preview_df, f"{run.name}_rag_responses", key=f"download_import_preview_{run.run_id}")
 
         else:
             if not approved_samples:
@@ -2151,6 +2171,38 @@ with tab_experiment:
                     ),
                     height=150,
                 )
+            with st.expander("调用性能参数（可选）", expanded=False):
+                perf_col_timeout, perf_col_retry, perf_col_workers = st.columns(3)
+                with perf_col_timeout:
+                    api_timeout_seconds = st.number_input(
+                        "单条请求超时时间（秒）",
+                        min_value=5,
+                        max_value=600,
+                        value=int(_api_preset.get("timeout_seconds", 120)),
+                        step=5,
+                        key="external_api_timeout_seconds",
+                        help="只影响本次外部 API 批量调用；接口较慢时可调大。",
+                    )
+                with perf_col_retry:
+                    api_retry_times = st.number_input(
+                        "失败重试次数",
+                        min_value=0,
+                        max_value=5,
+                        value=int(_api_preset.get("retry_times", 0)),
+                        step=1,
+                        key="external_api_retry_times",
+                        help="默认不重试。只对超时、连接错误、429 和 5xx 生效。",
+                    )
+                with perf_col_workers:
+                    api_max_workers = st.number_input(
+                        "最大并发请求数",
+                        min_value=1,
+                        max_value=20,
+                        value=int(_api_preset.get("max_workers", 1)),
+                        step=1,
+                        key="external_api_max_workers",
+                        help="本地 Agentic RAG 或单 worker FastAPI 建议设为 1，避免请求排队后客户端超时。",
+                    )
             _api_spacer, _api_col = st.columns([4, 1.4])
             with _api_col:
                 run_external_api = st.button("验证并批量调用外部 API", type="primary", use_container_width=True)
@@ -2166,7 +2218,13 @@ with tab_experiment:
                     response_mapping=parse_mapping(response_mapping_text, {"answer": "answer"}),
                     static_payload_json=static_payload_text,
                 )
-                connector = ExternalAPIConnector(config, connector_config)
+                api_run_config = dataclasses.replace(
+                    config,
+                    request_timeout_seconds=int(api_timeout_seconds),
+                    retry_times=int(api_retry_times),
+                    max_workers=int(api_max_workers),
+                )
+                connector = ExternalAPIConnector(api_run_config, connector_config)
                 ok, message = connector.validate()
                 if not ok:
                     st.error(message)
@@ -2178,6 +2236,9 @@ with tab_experiment:
                         "static_payload_json": static_payload_text,
                         "request_mapping_json": request_mapping_text,
                         "response_mapping_json": response_mapping_text,
+                        "timeout_seconds": int(api_timeout_seconds),
+                        "retry_times": int(api_retry_times),
+                        "max_workers": int(api_max_workers),
                     })
                     progress_bar = st.progress(0)
                     status = st.empty()
@@ -2199,6 +2260,9 @@ with tab_experiment:
                             "response_mapping": connector_config.response_mapping,
                             "cost_per_1k_tokens": cost_per_1k,
                             "score_version": config.score_version,
+                            "timeout_seconds": int(api_timeout_seconds),
+                            "retry_times": int(api_retry_times),
+                            "max_workers": int(api_max_workers),
                         },
                     )
                     store.save_experiment(run)
@@ -2222,7 +2286,7 @@ with tab_experiment:
                     )
                     st.subheader("本次 API 返回结果预览")
                     _show_df(preview_df)
-                    offer_dataframe_download(preview_df, f"{run.name}_rag_responses")
+                    offer_dataframe_download(preview_df, f"{run.name}_rag_responses", key=f"download_api_preview_{run.run_id}")
 
 
 with tab_eval:
@@ -2819,7 +2883,7 @@ with tab_eval:
             if "综合得分" in display_df.columns:
                 display_df = display_df[pd.to_numeric(display_df["综合得分"], errors="coerce").fillna(0) <= score_filter]
             _show_df(display_df)
-            offer_dataframe_download(user_df, f"{run.name}_evaluation_details")
+            offer_dataframe_download(user_df, f"{run.name}_evaluation_details", key=f"download_eval_details_{run.run_id}")
 
             with st.expander("查看内部评分字段"):
                 _show_df(results_dataframe(results))
@@ -3067,7 +3131,7 @@ with tab_eval:
             st.subheader("尚未评分的 RAG 回答")
             preview_df = response_review_dataframe(responses, samples)
             _show_df(preview_df)
-            offer_dataframe_download(preview_df, f"{run.name}_rag_responses")
+            offer_dataframe_download(preview_df, f"{run.name}_rag_responses", key=f"download_unscored_responses_{run.run_id}")
 
 
 with tab_compare:
