@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from statistics import mean
 from typing import TYPE_CHECKING
 
@@ -20,16 +22,87 @@ EMBEDDING_MODELS = {
 
 _model_cache: dict = {}
 
+# 默认补全的命名空间：sentence-transformers 上传方
+_DEFAULT_ORG = "sentence-transformers"
 
-def _load_model(model_name: str):
-    if model_name not in _model_cache:
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as exc:
-            raise ImportError(
-                "语义嵌入评估需要 sentence-transformers，请运行：pip install sentence-transformers"
-            ) from exc
-        logger.info("加载嵌入模型 %s ...", model_name)
+
+class EmbeddingModelNotCachedError(RuntimeError):
+    """本地未缓存目标嵌入模型，且调用方未授权联网下载。"""
+
+    def __init__(self, model_name: str, cache_dir: Path):
+        self.model_name = model_name
+        self.cache_dir = cache_dir
+        super().__init__(
+            f"嵌入模型 {model_name} 未在本地缓存（缓存目录：{cache_dir}），且未授权联网下载。"
+        )
+
+
+def get_hf_cache_dir() -> Path:
+    """返回 HuggingFace Hub 模型缓存目录（遵循 HF_HOME / HUGGINGFACE_HUB_CACHE 环境变量）。"""
+    hub_cache = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    if hub_cache:
+        return Path(hub_cache)
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        return Path(hf_home) / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _candidate_cache_dirs(model_name: str) -> list[Path]:
+    """列出该模型可能落地的缓存目录候选。"""
+    hub = get_hf_cache_dir()
+    candidates: list[Path] = []
+    if "/" in model_name:
+        org, name = model_name.split("/", 1)
+        candidates.append(hub / f"models--{org}--{name}")
+    else:
+        candidates.append(hub / f"models--{_DEFAULT_ORG}--{model_name}")
+        candidates.append(hub / f"models--{model_name}")
+    # 兼容旧版 sentence-transformers 的 torch 缓存路径
+    st_legacy = Path.home() / ".cache" / "torch" / "sentence_transformers"
+    candidates.append(st_legacy / model_name.replace("/", "_"))
+    return candidates
+
+
+def is_model_cached(model_name: str) -> bool:
+    """检测目标嵌入模型是否已存在于本机缓存（含至少一个 snapshot 目录）。"""
+    for d in _candidate_cache_dirs(model_name):
+        if not d.exists():
+            continue
+        # HF hub 结构：models--xxx/snapshots/<rev>/<files>
+        snap_dir = d / "snapshots"
+        if snap_dir.exists() and any(snap_dir.iterdir()):
+            return True
+        # 旧版直接放模型文件
+        if any(d.glob("*.bin")) or any(d.glob("*.safetensors")) or (d / "config.json").exists():
+            return True
+    return False
+
+
+def expected_cache_path(model_name: str) -> Path:
+    """返回该模型推荐的下载落地目录（用于提示用户手动下载到哪里）。"""
+    return _candidate_cache_dirs(model_name)[0]
+
+
+def _load_model(model_name: str, allow_download: bool = False):
+    if model_name in _model_cache:
+        return _model_cache[model_name]
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise ImportError(
+            "语义嵌入评估需要 sentence-transformers，请运行：pip install sentence-transformers"
+        ) from exc
+
+    cached = is_model_cached(model_name)
+    if not cached and not allow_download:
+        raise EmbeddingModelNotCachedError(model_name, expected_cache_path(model_name))
+
+    logger.info("加载嵌入模型 %s (allow_download=%s) ...", model_name, allow_download)
+    # 已缓存时强制走 local_files_only，避免内网环境因 HF 探活请求被阻塞而长时间转圈
+    if cached and not allow_download:
+        _model_cache[model_name] = SentenceTransformer(model_name, local_files_only=True)
+    else:
         _model_cache[model_name] = SentenceTransformer(model_name)
     return _model_cache[model_name]
 

@@ -2364,15 +2364,63 @@ with tab_eval:
         _eval_max_contexts: int | None = None
         _eval_context_max_chars: int | None = None
 
+        embedding_allow_download = False
         if eval_mode == "embedding":
-            from app.services.embedding_evaluator import EMBEDDING_MODELS
+            from app.services.embedding_evaluator import (
+                EMBEDDING_MODELS,
+                expected_cache_path,
+                is_model_cached,
+            )
             eval_embedding_model = st.selectbox(
-                "嵌入模型（首次使用会自动下载到本地）",
+                "嵌入模型",
                 options=list(EMBEDDING_MODELS.keys()),
                 format_func=lambda x: f"{x}  ——  {EMBEDDING_MODELS[x]}",
                 key="embedding_model_select",
             )
             st.caption("模型下载后缓存在本机，评估无需网络连接和 API 费用。评估为单线程顺序执行，较慢但更稳定。")
+
+            _cached = is_model_cached(eval_embedding_model)
+            _cache_path = expected_cache_path(eval_embedding_model)
+            if _cached:
+                st.success(f"该模型已在本机缓存，可直接评估。缓存目录：`{_cache_path}`")
+            else:
+                st.warning(
+                    "该模型尚未在本机缓存，首次使用需要从 HuggingFace 下载（约 400MB–1GB）。"
+                    "在公司内网/无外网环境下，自动下载可能长时间卡住。"
+                )
+                with st.expander("如何手动下载模型（推荐内网用户使用）", expanded=False):
+                    _repo_id = eval_embedding_model if "/" in eval_embedding_model else f"sentence-transformers/{eval_embedding_model}"
+                    st.markdown(
+                        f"""
+**方式 A：在有外网的机器上用 huggingface_hub 下载，再拷贝到本机**
+
+```bash
+pip install huggingface_hub
+huggingface-cli download {_repo_id}
+```
+下载完成后，将整个 `models--{_repo_id.replace('/', '--')}` 目录拷贝到本机：
+```
+{_cache_path}
+```
+
+**方式 B：直接访问 HuggingFace 网页下载所有文件**
+
+打开 https://huggingface.co/{_repo_id}/tree/main ，
+下载全部文件并放到本机：`{_cache_path}/snapshots/<任意目录名>/`。
+
+**方式 C：使用国内镜像加速（如果外网不通但镜像通）**
+
+设置环境变量后重启本应用：
+```
+HF_ENDPOINT=https://hf-mirror.com
+```
+                        """
+                    )
+                embedding_allow_download = st.checkbox(
+                    "我已知晓上述风险，允许本次评估从 HuggingFace 联网下载该模型",
+                    value=False,
+                    key="embedding_allow_download",
+                )
             st.info(
                 "Windows 用户注意：首次运行时 Windows 智能应用控制（SAC）可能弹出拦截提示，"
                 "请点击【仍然运行】，或在 Windows 安全中心 → 应用和浏览器控制 → 智能应用控制中设为评估模式，"
@@ -2558,17 +2606,38 @@ with tab_eval:
                 limited = responses[: config.default_max_eval_questions]
 
                 if eval_mode == "embedding" and eval_embedding_model:
-                    with st.spinner(
-                        f"正在加载嵌入模型 {eval_embedding_model}……"
-                        "首次使用需要从 HuggingFace 下载（约470MB），请耐心等待，之后会缓存到本机。"
-                    ):
-                        from app.services.embedding_evaluator import _load_model
-                        try:
-                            _load_model(eval_embedding_model)
-                            st.success("模型加载完成，开始评估……")
-                        except Exception as _e:
-                            st.error(f"模型加载失败：{_e}")
-                            _ok = False
+                    from app.services.embedding_evaluator import (
+                        EmbeddingModelNotCachedError,
+                        _load_model,
+                        expected_cache_path,
+                        is_model_cached,
+                    )
+                    _already_cached = is_model_cached(eval_embedding_model)
+                    if not _already_cached and not embedding_allow_download:
+                        st.error(
+                            f"模型 {eval_embedding_model} 未在本机缓存。"
+                            f"请先勾选「允许联网下载」，或参考上方指引手动下载到：{expected_cache_path(eval_embedding_model)}"
+                        )
+                        _ok = False
+                    else:
+                        _spinner_msg = (
+                            f"正在加载本地缓存的嵌入模型 {eval_embedding_model}……"
+                            if _already_cached
+                            else f"正在从 HuggingFace 下载并加载 {eval_embedding_model}（约 400MB–1GB，内网环境可能较慢）……"
+                        )
+                        with st.spinner(_spinner_msg):
+                            try:
+                                _load_model(eval_embedding_model, allow_download=embedding_allow_download)
+                                st.success("模型加载完成，开始评估……")
+                            except EmbeddingModelNotCachedError as _e:
+                                st.error(str(_e))
+                                _ok = False
+                            except Exception as _e:
+                                st.error(
+                                    f"模型加载失败：{_e}。"
+                                    "若是网络超时，请参考上方「如何手动下载模型」指引。"
+                                )
+                                _ok = False
 
             if _ok:
                 limited = responses[: config.default_max_eval_questions]
