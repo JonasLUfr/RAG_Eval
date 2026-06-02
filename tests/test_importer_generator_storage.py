@@ -5,7 +5,7 @@ import pandas as pd
 
 from app.core.config import AppConfig
 from app.models import EvalResult, EvalSample, ExperimentRun, ProjectContext, ScoreItem, SystemResponse
-from app.services.importer import dataframe_to_responses
+from app.services.importer import dataframe_to_responses, dataframe_to_samples
 from app.services.testset_generator import TestsetGenerator as SampleGenerator
 from app.storage import SQLiteStore
 
@@ -45,6 +45,27 @@ def test_dataframe_to_responses_parses_lists_and_numbers():
     assert responses[0].citations == ["cite1", "cite2"]
     assert responses[0].latency_ms == 12.5
     assert responses[0].token_usage == 42
+
+
+def test_dataframe_to_samples_accepts_optional_gold_fields():
+    df = pd.DataFrame(
+        [
+            {
+                "question": "q",
+                "reference_answer": "a",
+                "expected_evidence": "e",
+                "gold_contexts": '["ctx1", "ctx2"]',
+                "relevant_context_ids": "chunk-1\nchunk-2",
+                "gold_label_status": "full_relevance_verified",
+            }
+        ]
+    )
+
+    samples = dataframe_to_samples(df)
+
+    assert samples[0].gold_contexts == ["ctx1", "ctx2"]
+    assert samples[0].relevant_context_ids == ["chunk-1", "chunk-2"]
+    assert samples[0].gold_label_status == "full_relevance_verified"
 
 
 def test_sqlite_store_roundtrip():

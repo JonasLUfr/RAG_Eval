@@ -11,7 +11,8 @@ from app.models import EvalResult, EvalSample, ScoreItem, SystemResponse
 from app.models.schemas import FAILURE_LABELS
 from app.services.executor import BatchExecutor
 from app.services.llm_client import OpenAICompatibleClient
-from app.services.rank_metrics import compute_rank_metrics
+from app.services.metric_metadata import filter_scores_for_available_annotations, recompute_normalized_score
+from app.services.rank_metrics import compute_rank_metrics, compute_strict_rank_metrics
 
 
 logger = logging.getLogger(__name__)
@@ -307,11 +308,25 @@ class EvaluationEngine:
                 continue
             evidence = sample.expected_evidence or ""
             contexts = [str(c) for c in (response.retrieved_contexts or []) + (response.citations or [])]
-            if not evidence.strip() or not contexts:
-                continue
-            rank_scores = compute_rank_metrics(contexts, evidence)
-            if rank_scores:
-                result.scores.update(rank_scores)
+            if evidence.strip() and contexts:
+                rank_scores = compute_rank_metrics(contexts, evidence)
+                if rank_scores:
+                    result.scores.update(rank_scores)
+            strict_rank_items = [str(c) for c in (response.citations or response.retrieved_contexts or [])]
+            strict_scores = compute_strict_rank_metrics(strict_rank_items, sample.relevant_context_ids)
+            if strict_scores:
+                result.scores.update(strict_scores)
+            filtered_scores, skipped_metrics = filter_scores_for_available_annotations(result.scores, sample)
+            if skipped_metrics:
+                result.scores = filtered_scores
+                result.normalized_score = recompute_normalized_score(filtered_scores)
+                skipped_text = ", ".join(skipped_metrics)
+                result.judge_reason = (
+                    f"{result.judge_reason} "
+                    f"[标注依赖不足：{skipped_text} 暂无法准确评分，未计入综合分。]"
+                ).strip()
+                if not filtered_scores:
+                    result.evaluation_status = "insufficient_annotations"
 
         elapsed = time.monotonic() - t0
         failed = sum(1 for r in results if not r.scores)

@@ -7,6 +7,7 @@ import pandas as pd
 
 from app.core.config import AppConfig
 from app.models import EvalResult, EvalSample, ExperimentRun, ProjectContext, SystemResponse
+from app.services.metric_metadata import metric_dependency_label, metric_quality_note
 
 
 class ExportCenter:
@@ -135,6 +136,16 @@ class ExportCenter:
         lines.append("")
 
         lines += ["## 题型分布", ""]
+        lines += [
+            "## 指标解释与适用条件",
+            "",
+            "- 无需人工金标：依赖问题、回答、真实检索上下文或系统运行数据。",
+            "- 需要参考答案：`correctness`、`completeness`、RAGAS 风格 `context_recall` 依赖人工审核过的 `reference_answer`。",
+            "- 需要预期证据：`hit_rate`、`evidence_coverage` 和当前弱 rank 指标依赖人工确认的 `expected_evidence`。",
+            "- 需要完整相关标注：严格 MRR / Recall@k / Precision@k 只在提供 `relevant_context_ids` 时计算。",
+            "",
+        ]
+        lines += ["## 题型分布", ""]
         if not qtype_df.empty:
             lines.append("| 题型 | 数量 |")
             lines.append("|------|------|")
@@ -215,6 +226,9 @@ class ExportCenter:
             rows.append({"指标": name, "平均分": round(sum(values) / len(values), 4) if values else 0})
         df = pd.DataFrame(rows)
         if not df.empty:
+            metric_col = df.columns[0]
+            df["标注依赖"] = df[metric_col].apply(metric_dependency_label)
+            df["适用条件"] = df[metric_col].apply(metric_quality_note)
             df = df.sort_values("平均分", ascending=False)
         return df
 

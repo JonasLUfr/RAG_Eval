@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 
 from app.models.schemas import ScoreItem
@@ -62,6 +63,15 @@ def rank_metric_names(ks: tuple[int, ...] = DEFAULT_KS) -> list[str]:
         names.append(f"recall_at_{k}")
     for k in ks:
         names.append(f"precision_at_{k}")
+    return names
+
+
+def strict_rank_metric_names(ks: tuple[int, ...] = DEFAULT_KS) -> list[str]:
+    names = ["strict_mrr"]
+    for k in ks:
+        names.append(f"strict_recall_at_{k}")
+    for k in ks:
+        names.append(f"strict_precision_at_{k}")
     return names
 
 
@@ -145,3 +155,76 @@ def compute_rank_metrics(
         )
 
     return out
+
+
+def compute_strict_rank_metrics(
+    returned_items: list[str],
+    relevant_context_ids: list[str],
+    ks: tuple[int, ...] = DEFAULT_KS,
+) -> dict[str, ScoreItem]:
+    """Compute strict rank metrics from returned IDs and human relevant IDs."""
+    relevant = {_normalize_id(x) for x in relevant_context_ids if _normalize_id(x)}
+    if not relevant:
+        return {}
+    ranked = [_candidate_ids(item) for item in returned_items if str(item).strip()]
+    if not ranked:
+        return {}
+
+    out: dict[str, ScoreItem] = {}
+    first_pos = -1
+    for i, ids in enumerate(ranked):
+        if ids & relevant:
+            first_pos = i + 1
+            break
+    mrr_value = 1.0 / first_pos if first_pos > 0 else 0.0
+    out["strict_mrr"] = ScoreItem(
+        raw_score=round(mrr_value, 4),
+        normalized_score=round(mrr_value, 4),
+        reason=f"首个相关 ID 位于第 {first_pos} 位。" if first_pos > 0 else "返回结果未命中人工相关 ID。",
+    )
+
+    for k in ks:
+        top_k = ranked[:k]
+        matched: set[str] = set()
+        for ids in top_k:
+            matched |= ids & relevant
+        recall = len(matched) / len(relevant) if relevant else 0.0
+        precision = sum(1 for ids in top_k if ids & relevant) / len(top_k) if top_k else 0.0
+        out[f"strict_recall_at_{k}"] = ScoreItem(
+            raw_score=round(recall, 4),
+            normalized_score=round(recall, 4),
+            reason=f"前 {k} 条命中 {len(matched)}/{len(relevant)} 个相关 ID。",
+        )
+        out[f"strict_precision_at_{k}"] = ScoreItem(
+            raw_score=round(precision, 4),
+            normalized_score=round(precision, 4),
+            reason=f"前 {k} 条中 {sum(1 for ids in top_k if ids & relevant)}/{len(top_k)} 条命中相关 ID。" if top_k else "无返回 ID。",
+        )
+    return out
+
+
+def _normalize_id(value: object) -> str:
+    return str(value).strip().lower()
+
+
+def _candidate_ids(item: object) -> set[str]:
+    text = str(item).strip()
+    if not text:
+        return set()
+    out = {_normalize_id(text)}
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        for key in ("id", "chunk_id", "chunkId", "doc_id", "docId", "document_id", "source_id", "source"):
+            value = parsed.get(key)
+            if value not in (None, ""):
+                out.add(_normalize_id(value))
+    for pattern in (
+        r"(?:chunk_id|chunkId|doc_id|docId|document_id|source_id|source|id)\s*[:=]\s*([A-Za-z0-9_.:/#-]+)",
+        r"\b([A-Za-z0-9_.-]+#chunk[A-Za-z0-9_.-]+)\b",
+    ):
+        for match in re.findall(pattern, text):
+            out.add(_normalize_id(match))
+    return {x for x in out if x}

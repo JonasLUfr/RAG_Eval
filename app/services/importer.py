@@ -59,6 +59,9 @@ def dataframe_to_samples(
         "expected_scope": "expected_scope",
         "reference_answer": "reference_answer",
         "expected_evidence": "expected_evidence",
+        "gold_contexts": "gold_contexts",
+        "relevant_context_ids": "relevant_context_ids",
+        "gold_label_status": "gold_label_status",
         "tags": "tags",
     }
     samples: list[EvalSample] = []

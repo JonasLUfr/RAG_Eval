@@ -38,6 +38,13 @@ from app.services.exporter import ExportCenter
 from app.services.form_presets import load_preset, redact_headers_json, save_preset
 from app.services.importer import dataframe_to_responses, dataframe_to_samples, read_uploaded_table
 from app.services.llm_client import OpenAICompatibleClient
+from app.services.metric_metadata import (
+    GOLD_LABEL_STATUS_OPTIONS,
+    annotation_status_summary,
+    metric_dependency_label,
+    metric_quality_note,
+    strict_rank_metric_names,
+)
 from app.services.rank_metrics import (
     DEFAULT_KS as RANK_KS,
     RANK_METRIC_TOOLTIPS,
@@ -267,6 +274,8 @@ def samples_to_dataframe(samples: list[EvalSample]) -> pd.DataFrame:
         data = sample.to_dict()
         data["tags"] = ",".join(sample.tags)
         data["source_context_refs"] = ",".join(sample.source_context_refs)
+        data["gold_contexts"] = "\n".join(sample.gold_contexts)
+        data["relevant_context_ids"] = ",".join(sample.relevant_context_ids)
         data["delete"] = False
         rows.append(data)
     return pd.DataFrame(rows)
@@ -299,6 +308,12 @@ def results_dataframe(results) -> pd.DataFrame:
         }
         for name, score in result.scores.items():
             row[name] = score.normalized_score
+        if result:
+            row["评分依据状态"] = (
+                "部分指标缺少标注，未计入综合分"
+                if "标注依赖不足" in str(result.judge_reason)
+                else "已按可用标注计分"
+            )
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -1894,12 +1909,31 @@ with tab_testset:
 
         samples = store.list_test_cases(project.project_id)
         st.subheader(f"测试用例审核表：{len(samples)} 条")
+        st.info(
+            "标注依赖提示：系统会只基于当前已提供的数据和标注计算可信评分。"
+            "如果缺少某类指标需要的必要标注，该指标会被标记为暂无法准确评分，并且不计入综合分。"
+        )
+        with st.expander("哪些指标需要哪些人工标注？", expanded=False):
+            st.markdown(
+                """
+- 不需要人工金标：成功率、延迟、token、relevance、faithfulness、hallucination_risk、context_relevance。
+- 需要 `reference_answer`：correctness、completeness、RAGAS 风格 context_recall。
+- 需要 `expected_evidence`：hit_rate、evidence_coverage、当前弱标注 MRR / Recall@k / Precision@k。
+- 需要 `relevant_context_ids`：严格 MRR / Recall@k / Precision@k。这里要求被测 RAG 返回的 context 或 citation 中能识别 chunk/doc ID。
+
+建议：如果只是做初筛，可以先填 question 和 reference_answer；如果要分析检索质量，至少补 expected_evidence；如果要做严格 IR 评估，再补 relevant_context_ids 并把 gold_label_status 标为 full_relevance_verified。
+                """
+            )
         if samples:
             edited_df = _edit_df(
                 samples_to_dataframe(samples),
                 use_container_width=True,
                 num_rows="dynamic",
                 column_config={
+                    "gold_label_status": st.column_config.SelectboxColumn(
+                        "gold_label_status",
+                        options=GOLD_LABEL_STATUS_OPTIONS,
+                    ),
                     "review_status": st.column_config.SelectboxColumn(
                         "review_status",
                         options=["待审核", "已通过", "已拒绝"],
@@ -1916,6 +1950,9 @@ with tab_testset:
                     "expected_scope",
                     "reference_answer",
                     "expected_evidence",
+                    "gold_contexts",
+                    "relevant_context_ids",
+                    "gold_label_status",
                     "tags",
                     "source_context_refs",
                     "generation_method",
@@ -2704,6 +2741,20 @@ HF_ENDPOINT=https://hf-mirror.com
             badge = _answer_only_badge(responses)
             if badge:
                 st.info(badge)
+            label_counts = annotation_status_summary(samples)
+            st.caption(
+                "标注可信度："
+                f"未验证 {label_counts.get('unverified', 0)}；"
+                f"参考答案已核 {label_counts.get('reference_verified', 0)}；"
+                f"预期证据已核 {label_counts.get('evidence_verified', 0)}；"
+                f"完整相关标注 {label_counts.get('full_relevance_verified', 0)}。"
+            )
+            insufficient_annotation_count = sum("标注依赖不足" in str(result.judge_reason) for result in results)
+            if insufficient_annotation_count:
+                st.warning(
+                    f"有 {insufficient_annotation_count} 条样本缺少部分指标所需标注。"
+                    "这些指标已标记为暂无法准确评分，并从综合分中排除；当前结果只基于已提供的数据和标注计算。"
+                )
             combo_findings = summary.get("metric_combo_findings") or metric_combo_findings(summary.get("metric_summary", {}))
             if combo_findings:
                 st.caption("指标叠加诊断")
@@ -2728,7 +2779,7 @@ HF_ENDPOINT=https://hf-mirror.com
                 ("高风险样本", str(high_risk_count), "综合得分低于 0.4"),
             ])
 
-            _rank_names_set = set(rank_metric_names())
+            _rank_names_set = set(rank_metric_names()) | set(strict_rank_metric_names())
             metric_rows = []
             for name, value in metric_summary.items():
                 if name in _rank_names_set:
@@ -2739,7 +2790,14 @@ HF_ENDPOINT=https://hf-mirror.com
                     status = "🔴 偏高" if value > 0.5 else "🟡 注意" if value > 0.3 else "🟢 正常"
                 else:
                     status = "🟢 良好" if value >= 0.65 else "🟡 一般" if value >= 0.4 else "🔴 偏低"
-                metric_rows.append({"指标": label, "分数": round(value, 3), "说明": desc, "状态": status})
+                metric_rows.append({
+                    "指标": label,
+                    "分数": round(value, 3),
+                    "标注依赖": metric_dependency_label(name),
+                    "说明": desc,
+                    "适用条件": metric_quality_note(name),
+                    "状态": status,
+                })
             if metric_rows:
                 metric_rows = sorted(metric_rows, key=lambda row: row["分数"], reverse=True)
                 metric_df = pd.DataFrame(metric_rows)
@@ -2754,6 +2812,8 @@ HF_ENDPOINT=https://hf-mirror.com
             # ── 常规 RAG 检索指标（rank-aware） ─────────────────────────────
             rank_present = {n: metric_summary[n] for n in rank_metric_names() if n in metric_summary}
             if rank_present:
+                st.info("当前展示的是弱标注排序指标：基于 expected_evidence 文本近似命中。Recall@k 在单条证据下实际是 Evidence Hit@k，不等同严格 IR Recall@k。")
+            if rank_present:
                 st.subheader("常规 RAG 检索指标")
                 st.caption(
                     "主流 IR / RAG 评测的秩序感知指标。与上方「指标概览」中的集合级 hit_rate / "
@@ -2766,6 +2826,8 @@ HF_ENDPOINT=https://hf-mirror.com
                         continue
                     label, help_text = RANK_METRIC_TOOLTIPS.get(name, (name, ""))
                     rank_table_rows.append({
+                        "标注依赖": metric_dependency_label(name),
+                        "适用条件": metric_quality_note(name),
                         "指标": label,
                         "分数": round(rank_present[name], 4),
                         "含义": help_text,
@@ -2806,6 +2868,26 @@ HF_ENDPOINT=https://hf-mirror.com
                     "Precision@5 远低于 Precision@1 → top-k 长尾有大量噪声 chunk。"
                 )
                 st.line_chart(chart_df, height=240)
+
+            strict_rank_present = {n: metric_summary[n] for n in strict_rank_metric_names() if n in metric_summary}
+            if strict_rank_present:
+                st.subheader("严格检索排序指标")
+                st.caption("仅当测试样本提供 relevant_context_ids，且被测系统返回的 citations 或 retrieved_contexts 中能匹配这些 ID 时计算。")
+                strict_rows = [
+                    {
+                        "指标": name,
+                        "分数": round(value, 4),
+                        "标注依赖": metric_dependency_label(name),
+                        "适用条件": metric_quality_note(name),
+                    }
+                    for name, value in strict_rank_present.items()
+                ]
+                _show_df(
+                    pd.DataFrame(strict_rows),
+                    column_config={
+                        "分数": st.column_config.ProgressColumn("分数", min_value=0, max_value=1, format="%.4f"),
+                    },
+                )
 
             # ── 深度分析 ──────────────────────────────────────────────────
             st.subheader("深度分析")

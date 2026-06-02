@@ -67,6 +67,9 @@ class EvalSample:
     expected_scope: str = ""
     reference_answer: str = ""
     expected_evidence: str = ""
+    gold_contexts: list[str] = field(default_factory=list)
+    relevant_context_ids: list[str] = field(default_factory=list)
+    gold_label_status: str = "unverified"
     tags: list[str] = field(default_factory=list)
     source_context_refs: list[str] = field(default_factory=list)
     generation_method: str = "manual"
@@ -88,8 +91,19 @@ class EvalSample:
         # LLM 生成或 JSON 导入时 expected_evidence 偶尔会以 list 形式给出，
         # 但 schema 与下游 (.strip()/Jaccard) 都按 str 处理，这里统一归一化。
         ev = data.get("expected_evidence")
+        ev = data.get("expected_evidence")
+        for key in ("gold_contexts", "relevant_context_ids"):
+            value = data.get(key)
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                    data[key] = parsed if isinstance(parsed, list) else [str(parsed)]
+                except json.JSONDecodeError:
+                    data[key] = [x.strip() for x in value.replace("\n", ",").split(",") if x.strip()]
         if isinstance(ev, list):
             data["expected_evidence"] = "\n".join(str(x).strip() for x in ev if str(x).strip())
+        if not data.get("gold_label_status"):
+            data["gold_label_status"] = "unverified"
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 
